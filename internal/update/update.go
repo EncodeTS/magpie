@@ -218,7 +218,7 @@ func latestFrom(ctx context.Context, feed, lang string) (*Release, error) {
 // only releases update themselves.
 func Released(v string) bool {
 	s := parse(v)
-	return s != nil && !describe.MatchString(s.pre) && !strings.Contains(s.pre, "dirty")
+	return s != nil && !describe.MatchString(s.pre) && !strings.Contains(s.pre, "dirty") && !isForkVersion(s.pre)
 }
 
 // describe matches what git describe adds after a tag: commits since, hash.
@@ -407,6 +407,9 @@ func Writable(dir string) bool {
 // bundle, ready for Install. It returns the unpacked app, a bundle whose
 // folder is named stagedName.
 func Stage(ctx context.Context, rel *Release, bundle string) (string, error) {
+	if err := blockOfficialInstall(rel); err != nil {
+		return "", err
+	}
 	a, ok := rel.Assets[AppAsset()]
 	if !ok {
 		return "", fmt.Errorf("release %s has no %s", rel.Version, AppAsset())
@@ -695,6 +698,9 @@ func ReplaceBinary(ctx context.Context, rel *Release) error {
 // StageBinary downloads the release's build for this binary out of sight
 // (binaryStage), ready for InstallBinary.
 func StageBinary(ctx context.Context, rel *Release) (string, error) {
+	if err := blockOfficialInstall(rel); err != nil {
+		return "", err
+	}
 	a, ok := rel.Assets[BinaryAsset()]
 	if !ok {
 		return "", fmt.Errorf("release %s has no %s", rel.Version, BinaryAsset())
