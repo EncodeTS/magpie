@@ -231,8 +231,11 @@ func TestClaudeBlocksNeverGoToAResponsesAPI(t *testing.T) {
 	if strings.Contains(string(sent), claudeseal.Mark) || !strings.Contains(string(sent), "gAAAA-openai-sealed") {
 		t.Fatalf("relay was sent %s", sent)
 	}
-	if !strings.Contains(string(sent), "I should list the files.") {
-		t.Fatalf("the summary went missing: %s", sent)
+	if strings.Contains(string(sent), "I should list the files.") {
+		t.Fatalf("Claude-sealed reasoning item should be dropped whole (#6774): %s", sent)
+	}
+	if !strings.Contains(string(sent), `"call_1"`) {
+		t.Fatalf("tool call went missing: %s", sent)
 	}
 
 	// Codex's own model on the ChatGPT backend

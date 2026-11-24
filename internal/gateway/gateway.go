@@ -3959,7 +3959,10 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		}
 	}()
 	nearBehind := map[string]bool{} // accounts near their cap moved behind the rest once
-	var nearInKey time.Duration     // the key's slot waited for before an account's turn near its cap
+	copilotHandoffTried := map[string]bool{}
+	copilotHandoffBody := map[string][]byte{}
+	copilotHandoffPending := map[string][][sha256.Size]byte{}
+	var nearInKey time.Duration // the key's slot waited for before an account's turn near its cap
 	// onWay takes back a turn counted out on its account from its
 	// near-cap check (lanes.plan) once its lane counts it, or it leaves
 	var onWay func()
@@ -4294,6 +4297,15 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			// conversation, isn't sent to be refused again; its own is
 			if b, ok := withoutRefused(stuck, c.vendor(), attemptBody); ok {
 				attemptBody = b
+			}
+			if accountAgent(c.p) == "copilot" {
+				scope := copilotHandoffScope(c)
+				if b, ok := withoutRefused(stuck, scope, attemptBody); ok {
+					attemptBody = b
+				}
+				if hb, ok := copilotHandoffBody[scope]; ok {
+					attemptBody = hb
+				}
 			}
 		}
 		if isGroup {
@@ -5092,6 +5104,20 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
 				i--
 				continue
+			}
+		}
+		if !hw.passing && from == provider.Responses && accountAgent(c.p) == "copilot" {
+			scope := copilotHandoffScope(c)
+			if !copilotHandoffTried[scope] && isCopilotEmptyInvalidBody(hw.code(), hw.errBody()) {
+				if b, dropped, ok := withoutObservedForeignReasoning(attemptBody, providerIssuer(c.p, c.model)); ok {
+					copilotHandoffTried[scope] = true
+					copilotHandoffBody[scope] = b
+					copilotHandoffPending[scope] = dropped
+					try.Fail = failForeign
+					s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
+					i--
+					continue
+				}
 			}
 		}
 		if updated && !outgrew && !hw.passing && hw.code() == 400 {
@@ -6044,6 +6070,13 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				}
 			}
 		} else if call.Status < 400 {
+			if from == provider.Responses && accountAgent(c.p) == "copilot" {
+				scope := copilotHandoffScope(c)
+				if dropped := copilotHandoffPending[scope]; len(dropped) > 0 {
+					noteRefused(stuck, scope, dropped)
+					delete(copilotHandoffPending, scope)
+				}
+			}
 			servedCandidate(c, call.Usage.Input+call.Usage.Output+call.Usage.CacheRead+call.Usage.CacheWrite)
 			// a thinking reply that went on to an answer is one more in the
 			// row that trusts the member's reasoning as it comes
@@ -8035,7 +8068,11 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	}
 	f, _ := w.(http.Flusher)
 	sniff := newSniffer(proto, res.Header.Get("Content-Type"))
-	defer func() { u.add(sniff.usage().advisedAs(advisor)) }()
+	sealObs := newSealObserver(proto, res.Header.Get("Content-Type"), providerIssuer(p, model))
+	defer func() {
+		sealObs.flush()
+		u.add(sniff.usage().advisedAs(advisor))
+	}()
 	var tidy *chatTidy
 	if proto == provider.Chat && sse {
 		tidy = &chatTidy{}
@@ -8259,6 +8296,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 		n, err := rd.Read(buf)
 		if n > 0 {
 			sniff.write(buf[:n])
+			sealObs.write(buf[:n])
 			if proto == provider.Chat && sse && gather == nil && sniff.u.Stop != "" && !sniff.tail.said() {
 				// the reply's end is in this or a later read, and nothing
 				// has been said in it: hold what follows for the void's
@@ -8468,6 +8506,7 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	if enumTidy != nil {
 		write(enumTidy.flush())
 	}
+	sealObs.flush()
 	if sse {
 		sniff.drain()
 	} else {

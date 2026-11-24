@@ -46,13 +46,11 @@ func claudePart(block json.RawMessage, summary Part) Part {
 	return summary
 }
 
-// withoutClaudeSeals is a Responses request body with no Claude block in
-// its reasoning items, for a Responses API: OpenAI would refuse the
-// envelope as invalid_encrypted_content, and Claude's thinking is no other
-// vendor's to read. An item keeps its summary, as it was before magpie
-// carried the block; one with none (a block signed with no text, or
-// redacted) goes. Every other item, and a body with none, goes byte for
-// byte.
+// withoutClaudeSeals is a Responses request body with no Claude-sealed
+// reasoning items (#6774): Responses APIs reject reasoning items whose
+// encrypted_content was stripped without stored state, so Claude-sealed
+// reasoning items are removed whole. Every other item, and a body with none,
+// goes byte for byte.
 func withoutClaudeSeals(body []byte) []byte {
 	if !bodyHas(body, claudeseal.Mark) {
 		return body
@@ -71,16 +69,6 @@ func withoutClaudeSeals(body []byte) []byte {
 			continue
 		}
 		changed = true
-		if len(r.Get("summary").Array()) == 0 && len(r.Get("content").Array()) == 0 {
-			continue
-		}
-		var m map[string]json.RawMessage
-		if decodeJSON(it, &m) != nil {
-			continue
-		}
-		delete(m, "encrypted_content")
-		b, _ := json.Marshal(m)
-		out = append(out, b)
 	}
 	if !changed {
 		return body

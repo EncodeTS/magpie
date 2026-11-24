@@ -1255,6 +1255,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 		return true
 	}
 	var sniff *usageSniffer
+	var sealObs *sealObserver
 	var refusal []byte // what OpenAI said, of a request it turned away
 	// how the last try's reply ended, for the log of one that ended early
 	// (codexEndedEarly): the read of OpenAI's that failed, the write to
@@ -1544,12 +1545,16 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 		if hw != nil {
 			stopWatch = hw.watch()
 		}
+		sealObs = nil
 		if rest == "/responses" {
 			ct := res.Header.Get("Content-Type")
 			if ct == "" && streams { // the ChatGPT backend streams without saying so
 				ct = "text/event-stream"
 			}
 			sniff = newSniffer(provider.Responses, ct)
+			if res.StatusCode < 400 {
+				sealObs = newSealObserver(provider.Responses, ct, codexIssuer(on, base, modelOf(body)))
+			}
 		}
 		f, _ := out.(http.Flusher)
 		buf := make([]byte, 32<<10)
@@ -1566,6 +1571,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 				}
 				if sniff != nil {
 					sniff.write(buf[:n])
+					sealObs.write(buf[:n])
 					first.see(buf[:n])
 					tools.add(buf[:n])
 				}
@@ -1588,6 +1594,7 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 			}
 		}
 		stopWatch()
+		sealObs.flush()
 		if hw == nil {
 			break
 		}

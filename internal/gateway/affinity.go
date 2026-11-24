@@ -31,6 +31,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -1438,11 +1439,15 @@ func noteRefused(key, who string, ss [][sha256.Size]byte) {
 // any other item's sealed copy alone; the rest stays as it is.
 func withoutRefused(key, who string, body []byte) ([]byte, bool) {
 	k := key + "|" + who
+	var blocked map[[sha256.Size]byte]bool
 	refusedSeals.Lock()
 	r, ok := refusedSeals.m[k]
 	if ok && time.Since(r.at) > stickKeep {
 		delete(refusedSeals.m, k)
 		ok = false
+	}
+	if ok {
+		blocked = maps.Clone(r.seals)
 	}
 	refusedSeals.Unlock()
 	if !ok {
@@ -1459,7 +1464,7 @@ func withoutRefused(key, who string, body []byte) ([]byte, bool) {
 	kept, changed := items[:0:0], false
 	for _, it := range items {
 		var t sealedItem
-		if decodeJSONView(it, &t) == nil && t.Enc != "" && r.seals[sha256.Sum256([]byte(t.Enc))] {
+		if decodeJSONView(it, &t) == nil && t.Enc != "" && blocked[sha256.Sum256([]byte(t.Enc))] {
 			if sealedKinds[t.Type] {
 				changed = true
 				continue
