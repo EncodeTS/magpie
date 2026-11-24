@@ -15,6 +15,15 @@ on:
         required: false
         default: true
         type: boolean
+      macos_runner:
+        description: 'macOS arm64 runner pool'
+        required: false
+        type: choice
+        default: 'macos-15'
+        options:
+          - macos-15
+          - macos-26
+          - macos-latest
 
 permissions:
   contents: read
@@ -71,12 +80,12 @@ jobs:
 
   darwin-arm64:
     needs: prepare
-    runs-on: macos-latest
+    runs-on: ${{ github.event.inputs.macos_runner || 'macos-15' }}
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -117,7 +126,7 @@ jobs:
           ditto -c -k --keepParent magpie.app magpie-darwin-arm64.zip
 
       - name: Upload darwin-arm64 artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: magpie-darwin-arm64
           path: |
@@ -130,9 +139,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -155,7 +164,7 @@ jobs:
           rm -f rsrc_windows_*.syso internal/update/launcher-*.com
 
       - name: Upload windows-amd64 artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: magpie-windows-amd64
           path: dist/magpie-windows-amd64.exe
@@ -167,7 +176,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Download windows-amd64 build
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: magpie-windows-amd64
           path: dist
@@ -211,13 +220,13 @@ jobs:
       contents: write
     steps:
       - name: Download macOS arm64 artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: magpie-darwin-arm64
           path: release-assets
 
       - name: Download Windows x64 artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: magpie-windows-amd64
           path: release-assets
@@ -230,7 +239,7 @@ jobs:
           cat SHA256SUMS
 
       - name: Upload consolidated workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: magpie-fork-packages
           path: release-assets/*
