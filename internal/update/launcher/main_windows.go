@@ -72,11 +72,48 @@ func main() {
 	if err != nil {
 		fail(err)
 	}
+	job := bindChildJob(p.Pid)
 	st, err := p.Wait()
+	if job != 0 {
+		_ = windows.CloseHandle(job)
+	}
 	if err != nil {
 		fail(err)
 	}
 	os.Exit(st.ExitCode())
+}
+
+// bindChildJob ties child pid to an anonymous Windows Job Object configured
+// with KILL_ON_JOB_CLOSE so killing magpie.com also terminates the child
+// magpie.exe instead of leaving an orphan serve process (#6806).
+func bindChildJob(pid int) windows.Handle {
+	job, err := windows.CreateJobObject(nil, nil)
+	if err != nil {
+		return 0
+	}
+	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	if _, err := windows.SetInformationJobObject(
+		job,
+		windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&info)),
+		uint32(unsafe.Sizeof(info)),
+	); err != nil {
+		_ = windows.CloseHandle(job)
+		return 0
+	}
+	proc, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(pid))
+	if err != nil {
+		_ = windows.CloseHandle(job)
+		return 0
+	}
+	err = windows.AssignProcessToJobObject(job, proc)
+	_ = windows.CloseHandle(proc)
+	if err != nil {
+		_ = windows.CloseHandle(job)
+		return 0
+	}
+	return job
 }
 
 func fail(err error) {

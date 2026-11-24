@@ -33,13 +33,13 @@ var goneOS = runtime.GOOS
 // folder as the agent does, so the folder is no leftover; known is false
 // when magpie can't tell, which never counts as gone.
 func (a *Agent) cliHeld() (held, known bool) {
-	if a.Bin != "" && (a.binsOwn(binAt(a.Bin)) || a.binsOwn(proc.FindTool(a.Bin))) {
+	if a.Bin != "" && a.findBin() != "" {
 		if a.ID != "goose" {
 			return true, true
 		}
 		// pressly's goose, a Go program, is not Block's (see goose's detect)
-		for _, bin := range []string{binAt(a.Bin), proc.FindTool(a.Bin)} {
-			if bin != "" && !goProgram(bin) {
+		for _, bin := range proc.FindTools(a.Bin) {
+			if a.binsOwn(bin) && !goProgram(bin) {
 				return true, true
 			}
 		}

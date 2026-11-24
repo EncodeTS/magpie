@@ -1870,6 +1870,7 @@ func copilotModels(ctx context.Context, app copilotApp) ([]catalog.Model, error)
 				} `json:"supports"`
 				Limits struct {
 					Prompt int `json:"max_prompt_tokens"`
+					Output int `json:"max_output_tokens"`
 				} `json:"limits"`
 			} `json:"capabilities"`
 			Policy *struct {
@@ -1942,7 +1943,8 @@ func copilotModels(ctx context.Context, app copilotApp) ([]catalog.Model, error)
 			// the prompt this account's Copilot takes for the model (936K
 			// for gemini-4-carbon), not models.dev's window for the id
 			// (1048576): over it Copilot answers 400 (codealc on X)
-			Context: catalog.Window(m.Capabilities.Limits.Prompt)}
+			Context: catalog.Window(m.Capabilities.Limits.Prompt),
+			Output:  m.Capabilities.Limits.Output}
 		if m.Billing != nil {
 			m.Billing.Prices.apply(&mm)
 		}

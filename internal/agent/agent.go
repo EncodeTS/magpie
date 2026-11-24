@@ -481,7 +481,7 @@ func (a *Agent) Detected() bool {
 	if a.sign != nil && a.sign() {
 		return true
 	}
-	if a.Bin != "" && a.binsOwn(binAt(a.Bin)) {
+	if a.Bin != "" && a.findBin() != "" {
 		return true
 	}
 	// one with no Bin, as its command's name is other tools' too, that
@@ -510,6 +510,19 @@ func binAt(name string) string {
 		return p
 	}
 	return proc.FindTool(name)
+}
+
+func (a *Agent) findBin() string {
+	if a.Bin == "" {
+		return ""
+	}
+	if p, err := proc.LookPathWhere(a.Bin, a.binsOwn); err == nil {
+		return p
+	}
+	if p := proc.FindToolWhere(a.Bin, a.binsOwn); a.binsOwn(p) {
+		return p
+	}
+	return ""
 }
 
 // agentDir reports whether p is a folder an agent itself made. Skill
