@@ -1,0 +1,261 @@
+name: Fork Build (macOS arm64 & Windows x64)
+
+on:
+  push:
+    tags:
+      - 'fork-*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version override (must contain -fork, e.g. 0.1.4761-fork.1)'
+        required: false
+        type: string
+      publish_release:
+        description: 'Create/update GitHub Pre-release on this fork'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      publish: ${{ steps.meta.outputs.publish }}
+    steps:
+      - name: Resolve fork version and tag
+        id: meta
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+          INPUT_PUBLISH: ${{ github.event.inputs.publish_release }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/fork-* ]]; then
+            TAG="$GITHUB_REF_NAME"
+            if [[ "$TAG" =~ ^fork-v([0-9]+\.[0-9]+\.[0-9]+)-([0-9A-Za-z.-]+)$ ]]; then
+              VERSION="${BASH_REMATCH[1]}-fork.${BASH_REMATCH[2]}"
+            else
+              raw="${TAG#fork-}"
+              raw="${raw#v}"
+              if [[ "$raw" == *-fork* ]]; then
+                VERSION="$raw"
+              else
+                VERSION="${raw}-fork.1"
+              fi
+            fi
+            PUBLISH="true"
+          else
+            if [[ -n "${INPUT_VERSION:-}" ]]; then
+              VERSION="${INPUT_VERSION#v}"
+            else
+              short_sha="${GITHUB_SHA:0:7}"
+              VERSION="0.1.4761-fork.${short_sha}"
+            fi
+            TAG="fork-v${VERSION}"
+            PUBLISH="${INPUT_PUBLISH:-true}"
+          fi
+
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]*fork[0-9A-Za-z.-]*$ ]]; then
+            echo "::error::Invalid fork version '$VERSION': must be semver with -fork prerelease suffix" >&2
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag=$TAG version=$VERSION publish=$PUBLISH"
+
+  darwin-arm64:
+    needs: prepare
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Verify Apple Silicon runner
+        run: |
+          [ "$(uname -m)" = "arm64" ]
+
+      - name: Build magpie.app (darwin/arm64)
+        run: make app VERSION="${{ needs.prepare.outputs.version }}"
+
+      - name: Ad-hoc sign and verify bundle
+        run: |
+          codesign --force --sign - magpie.app
+          codesign --verify --strict --verbose=2 magpie.app
+          codesign -dv --verbose=2 magpie.app 2>&1 || true
+
+      - name: Smoke check app version
+        run: |
+          out=$(./magpie.app/Contents/MacOS/magpie --version)
+          echo "$out"
+          echo "$out" | grep -F "magpie ${{ needs.prepare.outputs.version }}"
+
+      - name: Package DMG and ZIP
+        run: |
+          set -euo pipefail
+          DMG="magpie-darwin-arm64.dmg"
+          mkdir -p "$RUNNER_TEMP/dmg"
+          cp -R magpie.app "$RUNNER_TEMP/dmg/"
+          ln -s /Applications "$RUNNER_TEMP/dmg/Applications"
+          SIZE=$(( $(du -sm "$RUNNER_TEMP/dmg" | cut -f1) * 5 / 4 + 32 ))m
+          for try in 1 2 3 4 5; do
+            hdiutil create -volname magpie -srcfolder "$RUNNER_TEMP/dmg" -size "$SIZE" -ov -format UDZO "$DMG" && break
+            [ "$try" = 5 ] && exit 1
+            echo "hdiutil create failed (try $try), retrying"
+            rm -f "$DMG"
+            sleep $((try * 10))
+          done
+          ditto -c -k --keepParent magpie.app magpie-darwin-arm64.zip
+
+      - name: Upload darwin-arm64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: magpie-darwin-arm64
+          path: |
+            magpie-darwin-arm64.dmg
+            magpie-darwin-arm64.zip
+          if-no-files-found: error
+
+  windows-amd64:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build desktop executable (windows/amd64)
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+          WINVER=$(echo "$VERSION" | sed -E 's/^v//; s/[^0-9.].*//')
+          go run ./build/assetpack internal/gui/assets internal/gui/assets.zip
+          go run ./build/conpty
+          mkdir -p dist
+          go run github.com/tc-hib/go-winres@v0.3.3 make --in build/windows/winres.json --arch amd64 --out rsrc \
+            --file-version "${WINVER:-0.0.0}" --product-version "${WINVER:-0.0.0}"
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-s -w" \
+            -o internal/update/launcher-amd64.com ./internal/update/launcher
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build \
+            -tags production,comlauncher,packedassets,conptypair -trimpath \
+            -ldflags="-s -w -X main.version=${VERSION} -H windowsgui" \
+            -o dist/magpie-windows-amd64.exe .
+          rm -f rsrc_windows_*.syso internal/update/launcher-*.com
+
+      - name: Upload windows-amd64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: magpie-windows-amd64
+          path: dist/magpie-windows-amd64.exe
+          if-no-files-found: error
+
+  windows-amd64-check:
+    needs: [prepare, windows-amd64]
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download windows-amd64 build
+        uses: actions/download-artifact@v4
+        with:
+          name: magpie-windows-amd64
+          path: dist
+
+      - name: Smoke check Windows binary and gateway
+        shell: pwsh
+        run: |
+          $env:MAGPIE_UPDATE_FEED = "http://127.0.0.1:9/"
+          $exe = "dist\magpie-windows-amd64.exe"
+          $v = (& $exe --version | Out-String).Trim()
+          Write-Output $v
+          if ($v -notlike "magpie ${{ needs.prepare.outputs.version }}*") {
+            throw "unexpected version: $v"
+          }
+          $log = "$env:RUNNER_TEMP\magpie"
+          $p = Start-Process -FilePath $exe -ArgumentList app -PassThru -RedirectStandardOutput "$log.out" -RedirectStandardError "$log.err"
+          function Fail($why) {
+            Get-Content "$log.out", "$log.err" -ErrorAction SilentlyContinue
+            throw $why
+          }
+          $ok = $false
+          foreach ($i in 1..30) {
+            Start-Sleep -Seconds 2
+            if ($p.HasExited) { Fail "magpie exited with $($p.ExitCode)" }
+            try {
+              Invoke-WebRequest http://127.0.0.1:3425/v1/models -UseBasicParsing | Out-Null
+              $ok = $true
+              break
+            } catch {}
+          }
+          if (-not $ok) { Fail "the gateway never answered" }
+          Start-Sleep -Seconds 5
+          if ($p.HasExited) { Fail "magpie exited with $($p.ExitCode)" }
+          Stop-Process -Id $p.Id
+          Write-Output "windows/amd64 magpie ran and served the gateway"
+
+  publish:
+    needs: [prepare, darwin-arm64, windows-amd64, windows-amd64-check]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download macOS arm64 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: magpie-darwin-arm64
+          path: release-assets
+
+      - name: Download Windows x64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: magpie-windows-amd64
+          path: release-assets
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum magpie-darwin-arm64.dmg magpie-darwin-arm64.zip magpie-windows-amd64.exe > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload consolidated workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: magpie-fork-packages
+          path: release-assets/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Pre-release
+        if: needs.prepare.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          notes=$(cat <<EOF
+          Personal fork build \`${VERSION}\` (macOS arm64 & Windows x64 only).
+
+          - macOS app bundle is ad-hoc signed (\`codesign --sign -\`, not notarised). After moving \`magpie.app\` to \`/Applications\`, clear quarantine if Gatekeeper prompts:
+            \`xattr -dr com.apple.quarantine /Applications/magpie.app\`
+          - Official \`usemagpie.ai\` / \`yetone/magpie-releases\` auto-update installs are disabled in this fork build.
+          EOF
+          )
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --prerelease --title "magpie ${VERSION}" --notes "$notes"
+            gh release upload "$TAG" release-assets/* -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" release-assets/* -R "$GITHUB_REPOSITORY" \
+              --prerelease --target "$GITHUB_SHA" --title "magpie ${VERSION}" --notes "$notes"
+          fi
