@@ -157,24 +157,66 @@ func (c *bodyCaps) learn(id string, n int) int {
 func capRoom(n int) int { return n / 4 * 3 }
 func capNear(n int) int { return n / 10 * 9 }
 
-// withinCap is body as it goes to p: fitted under the cap p refused a
-// larger request over, when one is known and body comes near it.
+func bodyCapKey(p provider.Provider, to provider.Protocol) string {
+	return p.ID + "|" + string(to)
+}
+
+type sentLenKey struct{}
+
+func withSentLen(ctx context.Context, n *int) context.Context {
+	return context.WithValue(ctx, sentLenKey{}, n)
+}
+
+func noteSentLen(ctx context.Context, n int) {
+	if p, ok := ctx.Value(sentLenKey{}).(*int); ok && p != nil {
+		*p = n
+	}
+}
+
+func sentLenOf(ctx context.Context) int {
+	if p, ok := ctx.Value(sentLenKey{}).(*int); ok && p != nil {
+		return *p
+	}
+	return 0
+}
+
+// withinCap is body as it goes to p: fitted under any built-in endpoint cap or
+// learned provider cap when body comes near it.
 func (s *Server) withinCap(p provider.Provider, to provider.Protocol, path string, body []byte) []byte {
 	out, left := s.capFit(p, to, path, body)
 	if left > 0 {
-		log.Printf("%s: the request is %s, over the %s it takes in one request; the %d oldest images left out (%s)", p.Name, mb(len(body)), mb(s.bodyCaps.of(p.ID)), left, mb(len(out)))
+		capBytes := s.bodyCaps.of(bodyCapKey(p, to))
+		if hard, _ := knownBodyCap(p, to, body); hard > 0 && (capBytes == 0 || hard < capBytes) {
+			capBytes = hard
+		}
+		log.Printf("%s: the request is %s, over the %s it takes in one request; the %d oldest images left out (%s)", p.Name, mb(len(body)), mb(capBytes), left, mb(len(out)))
+	} else if len(out) < len(body) {
+		log.Printf("%s: fitted request images from %s to %s", p.Name, mb(len(body)), mb(len(out)))
 	}
 	return out
 }
 
-// capFit is withinCap without its log line: body fitted under p's known
-// cap, and how many images were left out for it.
+// capFit is withinCap without its log line: body fitted under p's built-in or
+// learned cap, and how many images were left out for it.
 func (s *Server) capFit(p provider.Provider, to provider.Protocol, path string, body []byte) ([]byte, int) {
-	n := s.bodyCaps.of(p.ID)
-	if n <= 0 || len(body) <= capNear(n) || countsTokens(path) {
+	if countsTokens(path) {
 		return body, 0
 	}
-	out, left, ok := withoutOldImages(to, body, capRoom(n))
+	hardCap, perImg := knownBodyCap(p, to, body)
+	n := s.bodyCaps.of(bodyCapKey(p, to))
+	target := 0
+	if n > 0 && len(body) > capNear(n) {
+		target = capRoom(n)
+	}
+	if hardCap > 0 && (len(body) > hardCap || perImg > 0) {
+		if target == 0 || hardCap < target {
+			target = hardCap
+		}
+	}
+	if target == 0 && perImg <= 0 {
+		return body, 0
+	}
+	out, left, ok := fitImageBudget(to, body, target, perImg)
 	if !ok {
 		return body, 0
 	}
@@ -183,11 +225,12 @@ func (s *Server) capFit(p provider.Provider, to provider.Protocol, path string, 
 
 // refitOverCap is forward's answer to res, a refusal of body for its
 // bytes (byteCapRefusal): the cap learned, and the request sent again
-// with its oldest images left out, as often as that brings it lower and
-// is refused again. When nothing more can go, the refusal is said as a
-// 413 that names the size, the cap and what was kept.
+// after compressing/fitting images or leaving oldest history images out.
+// When nothing more can go, the refusal is said as a 413 that names the
+// size, the cap and what was kept.
 func (s *Server) refitOverCap(ctx context.Context, p provider.Provider, to provider.Protocol, path string, body []byte, in http.Header, res *http.Response) (*http.Response, error) {
 	var err error
+	key := bodyCapKey(p, to)
 	for range 3 {
 		if res.StatusCode < 400 || countsTokens(path) {
 			return res, nil
@@ -199,29 +242,44 @@ func (s *Server) refitOverCap(ctx context.Context, p provider.Provider, to provi
 		if page && !pageOverSize(res.StatusCode, b, len(body)) {
 			return res, nil
 		}
-		sent := s.capSent(p, to, path, body)
+		sent := sentLenOf(ctx)
+		if sent == 0 {
+			sent = s.capSent(p, to, path, body)
+		}
 		if page && sent < pageCapLeast {
 			return res, nil
 		}
 		n := statedCap(b, sent)
 		if n == 0 {
-			n = capRoom(sent) // it said no number: less than was sent
+			n = sent
 		}
 		if page {
 			// a page is a guess at a cap, not a vendor's word: it isn't
 			// kept for the provider's later requests
-			if k := s.bodyCaps.of(p.ID); k > 0 && k < n {
+			if k := s.bodyCaps.of(key); k > 0 && k < n {
 				n = k
 			}
 		} else {
-			n = s.bodyCaps.learn(p.ID, n)
+			n = s.bodyCaps.learn(key, n)
 		}
-		fitted, left, ok := withoutOldImages(to, body, capRoom(n))
+		target := capRoom(n)
+		if hardCap, _ := knownBodyCap(p, to, body); hardCap > 0 && hardCap < target {
+			target = hardCap
+		}
+		fitted, left, ok := fitImageBudget(to, body, target, 0)
 		if !ok || len(fitted) >= sent {
 			res.Body.Close()
-			return overCap(res, b, p, len(body), statedCap(b, len(body)), images(to, body), page), nil
+			capVal := statedCap(b, len(body))
+			if capVal == 0 {
+				capVal, _ = knownBodyCap(p, to, body)
+			}
+			return overCap(res, b, p, len(body), capVal, images(to, body), page), nil
 		}
-		log.Printf("%s refused a request of %s (HTTP %d: %s); asking again with the %d oldest images left out (%s)", p.Name, mb(sent), res.StatusCode, provider.APIError(b, ""), left, mb(len(fitted)))
+		if left > 0 {
+			log.Printf("%s refused a request of %s (HTTP %d: %s); asking again with the %d oldest images left out (%s)", p.Name, mb(sent), res.StatusCode, provider.APIError(b, ""), left, mb(len(fitted)))
+		} else {
+			log.Printf("%s refused a request of %s (HTTP %d: %s); asking again with fitted images (%s)", p.Name, mb(sent), res.StatusCode, provider.APIError(b, ""), mb(len(fitted)))
+		}
 		res.Body.Close()
 		// fitted is under capNear already, so forwardOnce sends it as it is
 		if res, err = s.forwardOnce(ctx, p, to, path, fitted, in); err != nil {
@@ -231,11 +289,19 @@ func (s *Server) refitOverCap(ctx context.Context, p provider.Provider, to provi
 	if res.StatusCode >= 400 {
 		b := peekError(res)
 		page := !byteCapRefusal(res.StatusCode, b)
-		if !page || pageOverSize(res.StatusCode, b, len(body)) && s.capSent(p, to, path, body) >= pageCapLeast {
+		sent := sentLenOf(ctx)
+		if sent == 0 {
+			sent = s.capSent(p, to, path, body)
+		}
+		if !page || pageOverSize(res.StatusCode, b, len(body)) && sent >= pageCapLeast {
 			// refused as often as it was asked smaller: said as a 413, so
 			// Codex's compaction asks as text (summaryTooLarge)
 			res.Body.Close()
-			return overCap(res, b, p, len(body), statedCap(b, len(body)), images(to, body), page), nil
+			capVal := statedCap(b, len(body))
+			if capVal == 0 {
+				capVal, _ = knownBodyCap(p, to, body)
+			}
+			return overCap(res, b, p, len(body), capVal, images(to, body), page), nil
 		}
 	}
 	return res, nil

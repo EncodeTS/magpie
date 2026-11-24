@@ -6586,6 +6586,8 @@ func (s *Server) forward(ctx context.Context, p provider.Provider, to provider.P
 		// which images a try named by file (deepseek_files.go)
 		ctx = context.WithValue(ctx, dsSentKey{}, &dsSent{})
 	}
+	var sentLen int
+	ctx = withSentLen(ctx, &sentLen)
 	res, err = s.forwardOnce(ctx, p, to, path, body, in)
 	if err != nil {
 		// a Remote magpie whose computer came back at another address
@@ -6709,9 +6711,6 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 	// DeepSeek's own API: inline images it holds for this key named by
 	// file id, uploaded once (deepseek_files.go)
 	body, byFile := s.withDeepSeekFiles(reqCtx, p, to, path, body)
-	// under the byte cap the provider refused a larger request over,
-	// its oldest images left out (body_cap.go)
-	body = s.withinCap(p, to, path, body)
 	if to == provider.Responses {
 		// whatever the route, Claude's blocks never reach a Responses API
 		body = withoutClaudeSeals(body)
@@ -6796,6 +6795,9 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 		}
 		body = extra
 	}
+	// under any built-in endpoint cap or learned provider cap (body_cap.go),
+	// after ExtraBody so user-injected fields count toward the wire budget
+	body = s.withinCap(p, to, path, body)
 	if !countsTokens(path) {
 		// the tier it goes at, the user's own fields in it (#1784)
 		noteWireTier(ctx, to, body)
@@ -6829,6 +6831,7 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 	}
 	// the body goes once it is answered, not when a stream ends (#3383)
 	provider.SetBody(req, body)
+	noteSentLen(ctx, len(body))
 	defer provider.LetGo(req)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
