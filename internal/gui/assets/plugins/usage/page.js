@@ -5920,7 +5920,7 @@ const QUOTA_RANGES = [["off", "Off", "No curves on the cards"], ["2d", "2 days",
 function renderQuotaTrend() {
   const b = $("#quotaTrend");
   if (!b || b.nextElementSibling?.classList.contains("qt-days")) return;
-  b.hidden = !quotas?.some((q) => !q.error && (quotaLines(q).length || q.balanceTrend?.points?.length > 1));
+  b.hidden = !quotas?.some((q) => !q.error && (quotaLines(q).length || q.balanceTrend?.points?.length > 1 || q.windows?.some((w) => w.amountTrend?.length > 1)));
   if (b.hidden) return;
   b.classList.toggle("set", quotaRange !== "off");
   b.replaceChildren(el("span", "", t("Trends: {range}", { range: quotaRangeName(quotaRange) })), svg(CHEV, 11, 1.6));
@@ -5971,6 +5971,72 @@ function quotaDaysField(b) {
   b.after(i);
   i.focus(NO_SCROLL);
   i.select();
+}
+
+function spendCurve(sub) {
+  const balance = balanceCurve(sub);
+  if (quotaRange === "off") return balance;
+  const curves = sub.windows?.map(quotaAmountCurve).filter(Boolean) || [];
+  if (!curves.length) return balance;
+  const group = document.createDocumentFragment();
+  group.append(...curves);
+  if (balance) group.append(balance);
+  return group;
+}
+
+function quotaAmountCurve(window) {
+  if (!(window.amountTrend?.length >= 2)) return null;
+  const now = new Date(), days = quotaDays(quotaRange);
+  const midnight = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const points = window.amountTrend
+    .map((point) => ({ at: Date.parse(point.at), amount: point.amount }))
+    .filter((point) => Number.isFinite(point.at) && Number.isFinite(point.amount));
+  const shown = days ? points.filter((point) => point.at >= now - days * 864e5) : points;
+  if (shown.length < 2) return null;
+  const first = shown[0], last = shown.at(-1), baseline = points.find((point) => point.at >= midnight);
+  const start = Date.parse(window.startsAt), reset = Date.parse(window.resetsAt);
+  const from = days || !Number.isFinite(start) ? first.at : Math.min(start, first.at);
+  const to = days || !Number.isFinite(reset) ? last.at : Math.max(reset, last.at);
+  if (!(to > from)) return null;
+  const format = (amount) => amount.toLocaleString(intlLang(), { maximumFractionDigits: 2 }) + (window.unit ? " " + window.unit : "");
+  const title = t("Used over time"), label = t(window.name);
+  const box = el("div", "quota-curve balance-curve amount-curve");
+  const head = el("div", "qc-head");
+  head.append(el("span", "", title));
+  if (baseline && baseline.at < last.at && last.amount >= baseline.amount) {
+    const change = el("span", "qc-pace", t("Today (observed): +{amount}", { amount: format(last.amount - baseline.amount) }));
+    change.title = quotaCycleDate(baseline.at) + " – " + quotaCycleDate(last.at);
+    head.append(change);
+  }
+  const width = 300, height = 60;
+  const plot = sv("svg", { viewBox: `0 0 ${width} ${height}`, preserveAspectRatio: "none", class: "qc-plot", role: "img", "aria-label": title + " · " + label });
+  const axis = el("div", "qc-axis");
+  axis.append(el("span", "", quotaTimeText(from, +now)), el("span", "", quotaTimeText(to, +now)));
+  const legend = el("div", "qc-legend"), key = el("span", "qc-key"), dot = el("i"), color = "var(--c1)";
+  dot.style.background = color;
+  key.append(dot, el("span", "", label), el("b", "", format(last.amount)));
+  key.title = [t("Latest readings:"), ...shown.slice(-8).reverse().map((point) => format(point.amount) + " · " + quotaTimeText(point.at, +now))].join("\n");
+  legend.append(key);
+  const x = (at) => (at - from) / (to - from) * width;
+  const top = shown.reduce((max, point) => Math.max(max, point.amount), 1) * 1.08;
+  const y = (amount) => height - amount / top * height;
+  box.draw = () => {
+    plot.replaceChildren();
+    for (const fraction of [0, 0.5, 1]) {
+      plot.append(sv("line", { x1: 0, x2: width, y1: height * fraction, y2: height * fraction, class: "qc-grid" }));
+    }
+    const path = shown.map((point, index) => `${index ? "L" : "M"}${x(point.at).toFixed(1)} ${y(point.amount).toFixed(1)}`).join("");
+    plot.append(sv("path", { d: path, class: "qc-line" }, { stroke: color }));
+    if (to > +now && +now > from) {
+      plot.append(sv("line", { x1: x(+now), x2: x(+now), y1: 0, y2: height, class: "qc-now" }));
+    }
+    box.hover = { x0: from, x1: to, lines: [{ label, color, points: shown, text: (point) => format(point.amount) }] };
+  };
+  curveZoom(box, plot);
+  box.append(head, plot, axis, legend);
+  box.draw();
+  curveHover(box, plot, width, height);
+  return box;
 }
 
 // curveHover: a curve's readings nearest the pointer, each line's with its

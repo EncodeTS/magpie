@@ -1383,6 +1383,8 @@ type UsageWindow struct {
 	Models    []string `json:"models"`
 	NotModels []string `json:"notModels"`
 	Aside     bool     `json:"aside"`
+
+	AmountKnown bool `json:"amountKnown"`
 	// Pool is the group of models that share one allowance, and Family the
 	// model family a per-model window belongs to, as Antigravity's quota
 	// says them (QuotaWindow.Pool, QuotaWindow.Family)

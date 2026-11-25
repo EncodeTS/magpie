@@ -147,6 +147,39 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
 // it; the balance curve has one line, kept solid beside its dashed fit, and
 // its legend keeps its dot in the line's colour.
 for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
+  for (const [lang, expected] of [
+    ["en", { head: "Used over time", today: "Today (observed): +225.5 credits" }],
+    ["zh", { head: "累计用量趋势", today: "今日新增（已观测）：+225.5 credits" }],
+  ]) {
+    test(`${engine} ${lang}: cumulative usage shows the observed increase today without a depletion prediction`, async (t) => {
+      const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
+      t.after(() => browser.close());
+      const errors = [];
+      const page = await browser.newPage({ timezoneId: "Asia/Shanghai" });
+      page.on("pageerror", (e) => errors.push(e.message));
+      const now = Date.parse("2026-11-19T07:00:00Z");
+      await page.clock.setFixedTime(now);
+      const samples = [[-20, 1200], [-9, 1300], [0, 1525.5]].map(([hours, amount]) => ({ at: iso(now + hours * H), amount }));
+      const quota = { provider: "example-plugin", name: "Example", user: "user", readAt: iso(now), windows: [
+        { name: "Credits", amount: 1525.5, display: "1,526", unit: "credits", text: true, startsAt: "2026-11-01T00:00:00Z", resetsAt: "2026-12-01T00:00:00Z", amountTrend: samples },
+        { name: "One sample", amount: 0, display: "0", unit: "credits", text: true, amountTrend: [{ at: iso(now), amount: 0 }] },
+      ] };
+      await page.route("**/*", serve(lang, "light", [quota]));
+      await page.goto("http://magpie.test/?view=usage");
+      const curve = page.locator(".amount-curve");
+      await curve.waitFor({ timeout: 5000 });
+      assert.equal(await curve.count(), 1);
+      assert.equal(await curve.locator(".qc-head > span").first().textContent(), expected.head);
+      assert.equal(await curve.locator(".qc-pace").textContent(), expected.today);
+      assert.equal(await curve.locator(".qc-key b").textContent(), "1,525.5 credits");
+      assert.equal(await curve.locator(".qc-line").count(), 1);
+      assert.equal(await curve.locator(".qc-now").count(), 1);
+      assert.equal(await curve.locator(".qc-even").count(), 0);
+      assert.ok(await page.locator("#quotaTrend").isVisible());
+      assert.deepEqual(errors, []);
+    });
+  }
+
   test(`${engine}: colorblind mode leaves the balance curve's solid line, dashed fit and dot as they were`, async (t) => {
     const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
     t.after(() => browser.close());

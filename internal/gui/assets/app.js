@@ -16618,7 +16618,7 @@ function renderQuotas(lazy) {
       // what is left besides the windows, under them
       if (!history && sub.balance && sub.windows?.length && !sub.error) box.append(balanceRow(sub, "What is left on the account besides its windows", false));
       // the balance over time, and when it runs out at that pace
-      const spend = !brief && !history && !sub.error && balanceCurve(sub);
+      const spend = !brief && !history && !sub.error && spendCurve(sub);
       if (spend) box.append(spend);
       // when the windows were read: "Updated 3 min ago", or the time of
       // ones standing in for a reading that failed just now (#802; a

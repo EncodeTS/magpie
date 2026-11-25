@@ -231,6 +231,13 @@ func quotaOfPlugin(q SubscriptionQuota, u plugin.Usage) SubscriptionQuota {
 		if t, err := time.Parse(time.RFC3339, x.ResetsAt); err == nil {
 			w.ResetsAt = &t
 		}
+		w.Cumulative = used == nil && x.AmountKnown && w.Limit == 0 && w.Balance == nil && w.Unit != "" && w.ResetsAt != nil && w.Span > 0
+		if w.Cumulative {
+			w.Text = true
+			if w.Display == "" {
+				w.Display = groupedNumber(w.Amount) + " " + w.Unit
+			}
+		}
 		if t, err := time.Parse(time.RFC3339, x.RunsOutAt); err == nil {
 			w.RunsOutAt, w.RunsOut = &t, x.RunsOut
 		}

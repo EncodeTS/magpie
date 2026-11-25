@@ -55,19 +55,21 @@ func TestCreditsRunningOutReachTheQuotaReport(t *testing.T) {
 // without anyone deciding it (#3762 was RunsOutAt).
 func TestQuotaSpanCarriesEveryWindowField(t *testing.T) {
 	leftOut := map[string]string{
-		"resetSecs": "made into resetsAt from the report's now",
-		"family":    "the Usage page's grouping of per-model windows",
-		"credits":   "routing's (Allowance.OnCredits)",
-		"extra":     "routing's (Allowance.extraCapped)",
-		"capped":    "the GUI's cap marks (WithCapped)",
-		"capsSome":  "the GUI's cap marks (WithCapped)",
-		"capId":     "the GUI's cap marks (WithCapped)",
-		"ownCap":    "the GUI's cap marks (WithCapped)",
-		"startsAt":  "the GUI's Pace number (WithWindowStarts)",
-		"period":    "the GUI's Usage table columns (WithWindowPeriods)",
-		"trayKind":  "the GUI's menu bar picker (gui.withTrayKinds)",
-		"trayExtra": "the GUI's menu bar picker (gui.withTrayKinds)",
-		"heldBy":    "the GUI's all-accounts sum (WithHeldWindows)",
+		"resetSecs":   "made into resetsAt from the report's now",
+		"family":      "the Usage page's grouping of per-model windows",
+		"credits":     "routing's (Allowance.OnCredits)",
+		"extra":       "routing's (Allowance.extraCapped)",
+		"capped":      "the GUI's cap marks (WithCapped)",
+		"capsSome":    "the GUI's cap marks (WithCapped)",
+		"capId":       "the GUI's cap marks (WithCapped)",
+		"ownCap":      "the GUI's cap marks (WithCapped)",
+		"startsAt":    "the GUI's Pace number (WithWindowStarts)",
+		"period":      "the GUI's Usage table columns (WithWindowPeriods)",
+		"trayKind":    "the GUI's menu bar picker (gui.withTrayKinds)",
+		"trayExtra":   "the GUI's menu bar picker (gui.withTrayKinds)",
+		"heldBy":      "the GUI's all-accounts sum (WithHeldWindows)",
+		"cumulative":  "the local cumulative usage recorder (noteQuotaAmounts)",
+		"amountTrend": "the GUI's cumulative usage curve (WithQuotaAmountHistory)",
 	}
 	names := func(t reflect.Type) map[string]bool {
 		out := map[string]bool{}

@@ -513,6 +513,17 @@ scrolls in its own box at a narrow width, the subscription held at the left.
 See `usage-quota-table.test.cjs`, `usage-table-groups.test.cjs`,
 `usage-table-lengths.test.cjs` and `TestWithWindowPeriods`.
 
+### Cumulative usage trends
+
+Allowance cards can show cumulative usage in its original unit for plugin
+windows that report consumption and a cycle, but no share or limit. The current
+cycle's curve uses observed samples only. It displays the increase from today's
+first sample to today's latest sample when both exist, with their times in the
+tooltip. It does not invent earlier usage or show a depletion forecast. The
+[local history recorder](../../internal/provider/fork_quota_amount_history.go)
+reuses the ordinary allowance reads, retains up to 45 days, and keeps absolute
+counts separate from percentage history and usage sync.
+
 ### The Sessions page's folders
 
 The Sessions page lists an agent's project folders as one list, newest

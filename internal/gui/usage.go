@@ -300,7 +300,7 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 		if provider.SubscriptionUsageReading() {
 			rw.Header().Set("X-Magpie-Reading", "1")
 		}
-		writeJSON(rw, qs)
+		writeJSON(rw, provider.WithQuotaAmountHistory(qs, usage.Clock()))
 	})
 	// One card read again, from its refresh button (#840): ?provider= and,
 	// of a card with several accounts, &user=; the others are left as they
@@ -314,7 +314,8 @@ func usageRoutes(mux *http.ServeMux, w Windows) {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 		provider.RefreshUsage(ctx, id, r.URL.Query().Get("user"))
-		writeJSON(rw, withTrayKinds(provider.WithHeldWindows(provider.WithWindowPeriods(provider.WithWindowStarts(usage.WithWindowHolds(provider.InProviderOrder(provider.WithCheckins(provider.Quotas(ctx))), usage.Clock()), usage.Clock())), usage.Clock())))
+		qs := withTrayKinds(provider.WithHeldWindows(provider.WithWindowPeriods(provider.WithWindowStarts(usage.WithWindowHolds(provider.InProviderOrder(provider.WithCheckins(provider.Quotas(ctx))), usage.Clock()), usage.Clock())), usage.Clock()))
+		writeJSON(rw, provider.WithQuotaAmountHistory(qs, usage.Clock()))
 	})
 	// WorkBuddy's daily check-in pressed now, from the Usage card, for
 	// each account not in yet today, as `magpie accounts checkin` does; the

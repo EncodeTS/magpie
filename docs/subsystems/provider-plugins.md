@@ -373,6 +373,8 @@ A completed fetch still drains its queued response head before interpreting the 
 
 The GUI's plugin integration includes `subOf`, `pluginSubs`, and `startPluginSignIn`. A change to sign-in or provider presentation must follow these paths as well as the built-in paths it affects.
 
+On a usage window with no `used`, `limit` or `balance`, a plugin can report cycle-to-date consumption as `amount` (including an explicit zero), with `unit`, `resetsAt` and `span`. See [how Allowances draws these readings](gui-shell.md#cumulative-usage-trends). They remain display-only: they do not supply a share or change routing.
+
 ## Verification
 
 Plugins may also declare a provider-independent `magpie.hooks` entry, including pure gateway packages and mixed provider/Pi packages. Its asynchronous request contract and verification are documented in [Gateway request hooks](gateway-request-hooks.md). Existing provider hooks still use their normal entry path.

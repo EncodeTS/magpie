@@ -52,6 +52,9 @@ type QuotaWindow struct {
 	Amount float64 `json:"amount,omitempty"`
 	Limit  float64 `json:"limit,omitempty"`
 	Unit   string  `json:"unit,omitempty"`
+
+	Cumulative  bool           `json:"cumulative,omitempty"`
+	AmountTrend []BalancePoint `json:"amountTrend,omitempty"`
 	// RunsOutAt is when the soonest of what is left is lost, and RunsOut
 	// how much (in Unit), when it runs out apart from the window's reset:
 	// WorkBuddy's credits come in packages that each end on their own

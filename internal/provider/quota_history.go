@@ -303,6 +303,7 @@ func quotaHistKey(provider, user string) string { return provider + "|" + string
 // (quota_stale.go) isn't kept, and its card in qs is set to the later
 // window, so call it before the cards are cached.
 func noteQuotaHistory(qs []SubscriptionQuota, now time.Time) {
+	noteQuotaAmounts(qs, now)
 	quotaHistMu.Lock()
 	defer quotaHistMu.Unlock()
 	path := quotaHistPath()

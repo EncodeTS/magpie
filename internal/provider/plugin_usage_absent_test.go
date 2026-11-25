@@ -90,7 +90,8 @@ func TestPluginHostPassesAnAbsentUsedOn(t *testing.T) {
 	windows := filepath.Join(t.TempDir(), "windows.json")
 	if err := os.WriteFile(windows, []byte(`{
 		"a@fake": [{"name": "Credits", "display": "0 / 5000"}],
-		"full@fake": [{"name": "Credits", "used": 0, "display": "0 / 5000"}]
+		"full@fake": [{"name": "Credits", "used": 0, "display": "0 / 5000"}],
+		"count@fake": [{"name": "Credits", "amount": 0, "unit": "credits", "resetsAt": "2026-12-01T00:00:00Z", "span": 2592000}]
 	}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +106,7 @@ func TestPluginHostPassesAnAbsentUsedOn(t *testing.T) {
 	if _, err := plugin.Providers(ctx); err != nil {
 		t.Fatal(err)
 	}
-	for _, team := range []string{"a", "full"} {
+	for _, team := range []string{"a", "full", "count"} {
 		st, err := StartPluginSignIn("fakeco", 1, map[string]string{"where": "work", "team": team})
 		if err != nil {
 			t.Fatal(err)
@@ -125,12 +126,19 @@ func TestPluginHostPassesAnAbsentUsedOn(t *testing.T) {
 	if w := said.Windows[0]; w.Text || w.Aside {
 		t.Errorf("a 0 that was said: %+v", w)
 	}
+	counted := u["count@fake"]
+	if len(counted.Windows) != 1 || !counted.Windows[0].Cumulative || !counted.Windows[0].Text || !counted.Windows[0].Aside || counted.Windows[0].Display != "0 credits" {
+		t.Errorf("an explicit zero count without a limit: %+v", counted.Windows)
+	}
 	now := time.Now()
 	if a, ok := routedAllowance("plugin:fakeco", "a@fake", unsaid, now); ok {
 		t.Errorf("no share said, yet known: %+v", a)
 	}
 	if _, ok := routedAllowance("plugin:fakeco", "full@fake", said, now); !ok {
 		t.Error("a used of 0 that was said is not known")
+	}
+	if a, ok := routedAllowance("plugin:fakeco", "count@fake", counted, now); ok {
+		t.Errorf("cumulative count without a limit must not become a routed allowance: %+v", a)
 	}
 }
 

@@ -3415,6 +3415,7 @@ async function usageOf(provider, account, signal) {
       resetSecs: Math.max(0, Math.round(num(w?.resetSecs))),
       display: text(w?.display),
       amount: Math.max(0, num(w?.amount)),
+      amountKnown: typeof w?.amount === "number" && Number.isFinite(w.amount) && w.amount >= 0,
       limit: Math.max(0, num(w?.limit)),
       unit: text(w?.unit),
       span: Math.max(0, num(w?.span)),
