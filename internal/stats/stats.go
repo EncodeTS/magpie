@@ -56,7 +56,7 @@ func Off() bool {
 // start, and then whenever a new day (UTC) has begun. Only releases send
 // it, unless MAGPIE_STATS_HOST is set.
 func Run(version, what string) {
-	if !update.Released(version) && os.Getenv("MAGPIE_STATS_HOST") == "" {
+	if (!update.Released(version) || update.IsFork(version)) && os.Getenv("MAGPIE_STATS_HOST") == "" {
 		return
 	}
 	for {

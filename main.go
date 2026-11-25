@@ -7,6 +7,7 @@ import (
 
 	"github.com/yetone/magpie/internal/cli"
 	"github.com/yetone/magpie/internal/notices"
+	"github.com/yetone/magpie/internal/update"
 	// the built-in plugins, registered with the runtime (internal/pluginrt)
 	_ "github.com/yetone/magpie/plugins/all"
 )
@@ -23,6 +24,7 @@ var version = "dev"
 var thirdParty string
 
 func main() {
+	update.SetVersion(version)
 	notices.Text = thirdParty
 	cli.Main(version)
 }

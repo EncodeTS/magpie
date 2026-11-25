@@ -15,6 +15,13 @@ func isForkVersion(pre string) bool {
 	return strings.Contains(strings.ToLower(pre), "fork")
 }
 
+// IsFork reports whether v is a semver string whose prerelease identifies a
+// fork build (for example, "0.1.4777-fork.3").
+func IsFork(v string) bool {
+	s := parse(v)
+	return s != nil && isForkVersion(s.pre)
+}
+
 func isOfficialUpstreamURL(raw string) bool {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {

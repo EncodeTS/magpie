@@ -11,7 +11,7 @@ on:
         required: false
         type: string
       publish_release:
-        description: 'Create/update GitHub Pre-release on this fork'
+        description: 'Create/update GitHub Release on this fork'
         required: false
         default: true
         type: boolean
@@ -218,6 +218,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Download macOS arm64 artifacts
         uses: actions/download-artifact@v7
@@ -238,6 +240,38 @@ jobs:
           sha256sum magpie-darwin-arm64.dmg magpie-darwin-arm64.zip magpie-windows-amd64.exe > SHA256SUMS
           cat SHA256SUMS
 
+      - name: Sign SHA256SUMS
+        env:
+          FORK_UPDATE_SIGNING_KEY: ${{ secrets.FORK_UPDATE_SIGNING_KEY }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("node:fs");
+            const crypto = require("node:crypto");
+            const raw = (process.env.FORK_UPDATE_SIGNING_KEY || "").trim();
+            if (!raw) throw new Error("FORK_UPDATE_SIGNING_KEY secret is empty");
+            const seed = Buffer.from(raw, "base64");
+            if (seed.length !== 32) throw new Error("FORK_UPDATE_SIGNING_KEY must decode to 32 bytes");
+            const pkcs8Prefix = Buffer.from("302e020100300506032b657004220420", "hex");
+            const priv = crypto.createPrivateKey({ key: Buffer.concat([pkcs8Prefix, seed]), format: "der", type: "pkcs8" });
+            const pub = crypto.createPublicKey(priv);
+            const sums = fs.readFileSync("release-assets/SHA256SUMS", "utf8");
+            const msg = Buffer.from(`magpie release ${process.env.VERSION}\n${sums}`, "utf8");
+            const sig = crypto.sign(null, msg, priv);
+            if (!crypto.verify(null, msg, pub, sig)) throw new Error("self-verify failed");
+            fs.writeFileSync("release-assets/SHA256SUMS.sig", sig.toString("base64") + "\n", "utf8");
+          '
+
+      - name: Attest release artifacts
+        if: needs.prepare.outputs.publish == 'true'
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            release-assets/magpie-darwin-arm64.dmg
+            release-assets/magpie-darwin-arm64.zip
+            release-assets/magpie-windows-amd64.exe
+
       - name: Upload consolidated workflow artifact
         uses: actions/upload-artifact@v6
         with:
@@ -245,7 +279,7 @@ jobs:
           path: release-assets/*
           if-no-files-found: error
 
-      - name: Publish GitHub Pre-release
+      - name: Publish GitHub Release
         if: needs.prepare.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -253,18 +287,18 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          notes=$(cat <<EOF
+          notes=$(sed 's/^          //' <<EOF
           Personal fork build \`${VERSION}\` (macOS arm64 & Windows x64 only).
 
           - macOS app bundle is ad-hoc signed (\`codesign --sign -\`, not notarised). After moving \`magpie.app\` to \`/Applications\`, clear quarantine if Gatekeeper prompts:
             \`xattr -dr com.apple.quarantine /Applications/magpie.app\`
-          - Official \`usemagpie.ai\` / \`yetone/magpie-releases\` auto-update installs are disabled in this fork build.
+          - Self-updates point to \`EncodeTS/magpie\` Releases (verified with the fork Ed25519 key and GitHub SLSA build attestations); official \`usemagpie.ai\` / \`yetone/magpie-releases\` overwrites remain blocked.
           EOF
           )
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --prerelease --title "magpie ${VERSION}" --notes "$notes"
+            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --prerelease=false --latest --title "magpie ${VERSION}" --notes "$notes"
             gh release upload "$TAG" release-assets/* -R "$GITHUB_REPOSITORY" --clobber
           else
             gh release create "$TAG" release-assets/* -R "$GITHUB_REPOSITORY" \
-              --prerelease --target "$GITHUB_SHA" --title "magpie ${VERSION}" --notes "$notes"
+              --latest --target "$GITHUB_SHA" --title "magpie ${VERSION}" --notes "$notes"
           fi

@@ -62,7 +62,7 @@ func (rel *Release) verify() error {
 		}
 		return nil
 	}
-	pub, err := base64.StdEncoding.DecodeString(signingKey)
+	pub, err := base64.StdEncoding.DecodeString(activeSigningKey())
 	if err != nil || len(pub) != ed25519.PublicKeySize {
 		return errors.New("update signing key is not valid")
 	}

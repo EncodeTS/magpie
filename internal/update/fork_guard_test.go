@@ -9,17 +9,30 @@ import (
 
 func TestReleasedForkVersions(t *testing.T) {
 	cases := map[string]bool{
-		"0.1.4761":          true,
-		"v0.1.4761":         true,
-		"0.1.4761-fork":     false,
-		"0.1.4761-fork.1":   false,
-		"v0.1.4761-Fork.2":  false,
-		"0.1.4761-alpha.1":  true,
-		"0.1.4761-3-g123ab": false,
+		"0.1.4761":              true,
+		"v0.1.4761":             true,
+		"0.1.4761-fork":         true,
+		"0.1.4761-fork.1":       true,
+		"v0.1.4761-Fork.2":      true,
+		"0.1.4761-fork.2-dirty": false,
+		"0.1.4761-alpha.1":      true,
+		"0.1.4761-3-g123ab":     false,
 	}
 	for v, want := range cases {
 		if got := Released(v); got != want {
 			t.Errorf("Released(%q) = %v, want %v", v, got, want)
+		}
+	}
+	forkCases := map[string]bool{
+		"0.1.4761":         false,
+		"0.1.4761-fork":    true,
+		"0.1.4761-fork.1":  true,
+		"v0.1.4777-Fork.3": true,
+		"dev":              false,
+	}
+	for v, want := range forkCases {
+		if got := IsFork(v); got != want {
+			t.Errorf("IsFork(%q) = %v, want %v", v, got, want)
 		}
 	}
 }

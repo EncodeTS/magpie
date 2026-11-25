@@ -37,6 +37,9 @@ func NotesFeed() string {
 // ReleasePage is version's page on GitHub, where its notes are when the
 // site can't give them (#661).
 func ReleasePage(version string) string {
+	if forkUpdateActive() || IsFork(version) {
+		return forkReleasePage(version)
+	}
 	return "https://github.com/yetone/magpie-releases/releases/tag/v" + strings.TrimPrefix(strings.TrimSpace(version), "v")
 }
 
@@ -82,6 +85,9 @@ func NotesBack(ctx context.Context, upto string, n int, lang string) ([]Note, er
 
 // askNotes is the site's list for q, each release's notes in lang.
 func askNotes(ctx context.Context, q url.Values, lang string) ([]Note, error) {
+	if forkUpdateActive() && os.Getenv("MAGPIE_NOTES_FEED") == "" {
+		return forkGithubNotes(ctx, lang)
+	}
 	if lang != "" {
 		q.Set("lang", lang)
 	}

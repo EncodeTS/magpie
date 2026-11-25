@@ -159,7 +159,7 @@ func attestation(ctx context.Context, a Asset) error {
 			siteErr = fmt.Errorf("the bundles from %s fail: %v", hostOf(u), siteErr)
 		}
 	}
-	if Source() == settings.UpdateSourceSite {
+	if !forkUpdateActive() && Source() == settings.UpdateSourceSite {
 		if siteErr != nil {
 			return fmt.Errorf("%w: %v", errUnattested, siteErr)
 		}
@@ -246,7 +246,8 @@ func fetchSiteBundles(ctx context.Context, u string) []json.RawMessage {
 // bundles check themselves, so a mirror of the API (source.Do) can't make a
 // bad one pass.
 func fetchAttestations(ctx context.Context, digest string) ([]json.RawMessage, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", attestAPI+"/repos/"+attestRepo+"/attestations/sha256:"+digest, nil)
+	repo := activeAttestRepo()
+	req, err := http.NewRequestWithContext(ctx, "GET", attestAPI+"/repos/"+repo+"/attestations/sha256:"+digest, nil)
 	if err != nil {
 		return nil, errUnknown{err}
 	}
@@ -258,7 +259,7 @@ func fetchAttestations(ctx context.Context, digest string) ([]json.RawMessage, e
 	defer res.Body.Close()
 	switch {
 	case res.StatusCode == http.StatusNotFound:
-		return nil, fmt.Errorf("%w: GitHub has no build attestation for sha256:%s in %s", errUnattested, digest, attestRepo)
+		return nil, fmt.Errorf("%w: GitHub has no build attestation for sha256:%s in %s", errUnattested, digest, repo)
 	case res.StatusCode != http.StatusOK:
 		return nil, errUnknown{fmt.Errorf("GitHub's attestation API answered %s", res.Status)}
 	}
@@ -300,15 +301,16 @@ func verifyBundle(raw []byte, sum []byte) error {
 	if err != nil {
 		return err
 	}
-	san, err := verify.NewSANMatcher("", attestID.SAN)
+	idSpec := activeAttestID()
+	san, err := verify.NewSANMatcher("", idSpec.SAN)
 	if err != nil {
 		return err
 	}
-	iss, err := verify.NewIssuerMatcher(attestID.Issuer, "")
+	iss, err := verify.NewIssuerMatcher(idSpec.Issuer, "")
 	if err != nil {
 		return err
 	}
-	id, err := verify.NewCertificateIdentity(san, iss, certificate.Extensions{SourceRepositoryURI: attestID.Repo})
+	id, err := verify.NewCertificateIdentity(san, iss, certificate.Extensions{SourceRepositoryURI: idSpec.Repo})
 	if err != nil {
 		return err
 	}

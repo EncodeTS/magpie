@@ -149,6 +149,9 @@ func LatestEvery(ctx context.Context, lang string) (*Release, error) {
 // when it is Stable's version (the site's Stable download). Only the site
 // knows it, so a failed feed is never answered from GitHub.
 func LatestStable(ctx context.Context) (*Release, error) {
+	if forkUpdateActive() && Feed() == siteFeed {
+		return forkGithubLatest(ctx, "")
+	}
 	u, err := url.Parse(Feed())
 	if err != nil {
 		return nil, err
@@ -160,6 +163,9 @@ func LatestStable(ctx context.Context) (*Release, error) {
 }
 
 func latestAt(ctx context.Context, feed, lang string) (*Release, error) {
+	if forkUpdateActive() && Feed() == siteFeed {
+		return forkGithubLatest(ctx, lang)
+	}
 	if githubOnly() {
 		return githubLatest(ctx, lang)
 	}
@@ -218,7 +224,7 @@ func latestFrom(ctx context.Context, feed, lang string) (*Release, error) {
 // only releases update themselves.
 func Released(v string) bool {
 	s := parse(v)
-	return s != nil && !describe.MatchString(s.pre) && !strings.Contains(s.pre, "dirty") && !isForkVersion(s.pre)
+	return s != nil && !describe.MatchString(s.pre) && !strings.Contains(s.pre, "dirty")
 }
 
 // describe matches what git describe adds after a tag: commits since, hash.
