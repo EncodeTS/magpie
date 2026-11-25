@@ -17,13 +17,17 @@ import (
 )
 
 const (
-	copilotChatHardCap     = 5 * 1024 * 1024 // 5,242,880 B empirical GHCP /chat/completions UTF-8 JSON limit
-	copilotChatPerImageMax = 3 * 1024 * 1024 // 3 MiB per-image cap
-	copilotAutoReserve     = 256             // room for copilot_auto model rewrite
+	copilotChatHardCap     = 5 * 1024 * 1024          // 5,242,880 B empirical GHCP /chat/completions UTF-8 JSON limit
+	copilotChatSoftCap     = copilotChatHardCap * 4 / 5 // 4,194,304 B (80%) hysteresis target leaving ~1 MiB text room
+	copilotChatPerImageMax = 3 * 1024 * 1024          // 3 MiB per-image cap
+	copilotAutoReserve     = 256                      // room for copilot_auto model rewrite
 
 	budgetDeadline     = 3 * time.Second
 	budgetCacheMaxByte = 64 << 20
 	budgetCacheTTL     = 30 * time.Minute
+
+	stickyTierMaxEntries = 4096
+	stickyTierTTL        = 2 * time.Hour
 )
 
 // knownBodyCap returns any built-in endpoint-wide request-body limit and per-image
@@ -124,6 +128,160 @@ func budgetCachePut(sum [sha256.Size]byte, spec string, raw []byte, mime string)
 		imageBudgetCache.ll.Remove(back)
 		delete(imageBudgetCache.m, ent.key)
 	}
+}
+
+type stickyConvKey struct {
+	providerID string
+	to         provider.Protocol
+	convKey    string
+}
+
+type stickyTierKey struct {
+	providerID string
+	to         provider.Protocol
+	convKey    string
+	msgIdx     int
+	hash       [sha256.Size]byte
+}
+
+type stickyTierEntry struct {
+	key  stickyTierKey
+	tier int
+	at   time.Time
+}
+
+type stickyTierUpdate struct {
+	msgIdx int
+	hash   [sha256.Size]byte
+	tier   int
+}
+
+// imageStickyStore tracks the highest compression/drop tier committed for each
+// (provider, protocol, conversation, message index, image hash) across successful turns.
+type imageStickyStore struct {
+	mu        sync.Mutex
+	ll        *list.List
+	m         map[stickyTierKey]*list.Element
+	convCount map[stickyConvKey]int
+}
+
+func imageStickyConvKey(conv provider.Conversation) string {
+	if conv.Subagent != "" {
+		return conv.Session + "|" + conv.Subagent
+	}
+	return conv.Session
+}
+
+func (st *imageStickyStore) removeLocked(el *list.Element) {
+	ent := el.Value.(*stickyTierEntry)
+	st.ll.Remove(el)
+	delete(st.m, ent.key)
+	ck := stickyConvKey{providerID: ent.key.providerID, to: ent.key.to, convKey: ent.key.convKey}
+	if n := st.convCount[ck]; n <= 1 {
+		delete(st.convCount, ck)
+	} else {
+		st.convCount[ck] = n - 1
+	}
+}
+
+func (st *imageStickyStore) hasConv(providerID string, to provider.Protocol, convKey string) bool {
+	if convKey == "" {
+		return false
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.convCount) == 0 {
+		return false
+	}
+	return st.convCount[stickyConvKey{providerID: providerID, to: to, convKey: convKey}] > 0
+}
+
+func (st *imageStickyStore) get(providerID string, to provider.Protocol, convKey string, msgIdx int, hash [sha256.Size]byte) int {
+	if convKey == "" || hash == ([sha256.Size]byte{}) {
+		return 0
+	}
+	k := stickyTierKey{
+		providerID: providerID,
+		to:         to,
+		convKey:    convKey,
+		msgIdx:     msgIdx,
+		hash:       hash,
+	}
+	now := time.Now()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.ll == nil {
+		return 0
+	}
+	el, ok := st.m[k]
+	if !ok {
+		return 0
+	}
+	ent := el.Value.(*stickyTierEntry)
+	if now.Sub(ent.at) > stickyTierTTL {
+		st.removeLocked(el)
+		return 0
+	}
+	ent.at = now
+	st.ll.MoveToFront(el)
+	return ent.tier
+}
+
+func (st *imageStickyStore) commit(providerID string, to provider.Protocol, convKey string, updates []stickyTierUpdate) {
+	if convKey == "" || len(updates) == 0 {
+		return
+	}
+	ck := stickyConvKey{providerID: providerID, to: to, convKey: convKey}
+	now := time.Now()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.ll == nil {
+		st.ll = list.New()
+		st.m = map[stickyTierKey]*list.Element{}
+		st.convCount = map[stickyConvKey]int{}
+	}
+	for _, u := range updates {
+		if u.tier <= 0 || u.hash == ([sha256.Size]byte{}) {
+			continue
+		}
+		k := stickyTierKey{
+			providerID: providerID,
+			to:         to,
+			convKey:    convKey,
+			msgIdx:     u.msgIdx,
+			hash:       u.hash,
+		}
+		if el, ok := st.m[k]; ok {
+			ent := el.Value.(*stickyTierEntry)
+			if now.Sub(ent.at) > stickyTierTTL || u.tier > ent.tier {
+				ent.tier = u.tier
+			}
+			ent.at = now
+			st.ll.MoveToFront(el)
+			continue
+		}
+		ent := &stickyTierEntry{key: k, tier: u.tier, at: now}
+		el := st.ll.PushFront(ent)
+		st.m[k] = el
+		st.convCount[ck]++
+		for st.ll.Len() > stickyTierMaxEntries {
+			back := st.ll.Back()
+			if back == nil {
+				break
+			}
+			st.removeLocked(back)
+		}
+	}
+}
+
+type budgetFitOptions struct {
+	hardCap     int
+	triggerCap  int
+	softTarget  int
+	protTarget  int
+	dropTrigger int
+	perImageMax int
+	stickyTier  func(msgIdx int, hash [sha256.Size]byte) int
 }
 
 type byteEdit struct {
@@ -386,6 +544,9 @@ func collectBudgetImages(to provider.Protocol, body []byte) []budgetImage {
 					}
 				}
 				if im.kind != imgKindDropOnly || len(v.Raw) >= 1<<10 {
+					if im.kind == imgKindDropOnly && im.hash == ([sha256.Size]byte{}) {
+						im.hash = sha256.Sum256([]byte(v.Raw))
+					}
 					out = append(out, im)
 				}
 				return
@@ -624,31 +785,38 @@ func applyByteEdits(body []byte, edits []byteEdit) []byte {
 // using the 5-tier ladder while protecting the current turn's images (latestUser+)
 // and rolling back unnecessary degradation steps once under budget.
 func fitImageBudget(to provider.Protocol, body []byte, hardCap, perImageMax int) (out []byte, dropped int, ok bool) {
-	if (hardCap <= 0 || len(body) <= hardCap) && (perImageMax <= 0 || len(body) <= perImageMax) {
-		return body, 0, true
-	}
-	imgs := collectBudgetImages(to, body)
-	if len(imgs) == 0 {
-		return body, 0, hardCap <= 0 || len(body) <= hardCap
+	out, dropped, _, ok = fitImageBudgetWithOptions(to, body, budgetFitOptions{
+		hardCap:     hardCap,
+		triggerCap:  hardCap,
+		softTarget:  hardCap,
+		protTarget:  hardCap,
+		dropTrigger: hardCap,
+		perImageMax: perImageMax,
+	})
+	return out, dropped, ok
+}
+
+// fitImageBudgetWithOptions fits body using separate trigger, soft-target (hysteresis),
+// protected-image, and drop thresholds, applying sticky historical tiers first and
+// compressing newer history images before older ones to maximize upstream KV prefix cache hits.
+func fitImageBudgetWithOptions(to provider.Protocol, body []byte, opts budgetFitOptions) (out []byte, dropped int, updates []stickyTierUpdate, ok bool) {
+	if opts.stickyTier == nil &&
+		(opts.triggerCap <= 0 || len(body) <= opts.triggerCap) &&
+		(opts.perImageMax <= 0 || len(body) <= opts.perImageMax) {
+		if opts.hardCap > 0 && len(body) > opts.hardCap {
+			return body, 0, nil, false
+		}
+		return body, 0, nil, true
 	}
 
-	needPerImg := false
-	if perImageMax > 0 {
-		for i := range imgs {
-			if imgs[i].approxRawBytes() > perImageMax*9/10 {
-				if imgs[i].ensureOrig() && len(imgs[i].origRaw) > perImageMax {
-					needPerImg = true
-					break
-				}
-			}
-		}
-	}
-	if (hardCap <= 0 || len(body) <= hardCap) && !needPerImg {
-		return body, 0, true
+	imgs := collectBudgetImages(to, body)
+	if len(imgs) == 0 {
+		return body, 0, nil, opts.hardCap <= 0 || len(body) <= opts.hardCap
 	}
 
 	versions := make([][]imgSnapshot, len(imgs))
 	curVer := make([]int, len(imgs))
+	floorVer := make([]int, len(imgs))
 	for i := range imgs {
 		versions[i] = []imgSnapshot{{kind: snapOrig}}
 	}
@@ -667,6 +835,51 @@ func fitImageBudget(to provider.Protocol, body []byte, hardCap, perImageMax int)
 		steps = append(steps, applyStep{imgIdx: idx, prevVer: prevVer, newVer: newVer})
 	}
 
+	canDrop := func(idx int) bool {
+		if imgs[idx].isProtected {
+			return false
+		}
+		if imgs[idx].partEnd-imgs[idx].partAt < 1<<10 || imgs[idx].dropText == "" {
+			return false
+		}
+		return validSpan(body, gjson.Result{Index: imgs[idx].partAt, Raw: string(body[imgs[idx].partAt:imgs[idx].partEnd])})
+	}
+
+	// Step 0: apply previously committed sticky tiers before checking triggers so
+	// established history prefixes stay byte-identical once back under triggerCap.
+	if opts.stickyTier != nil {
+		for i := range imgs {
+			if imgs[i].hash == ([sha256.Size]byte{}) {
+				continue
+			}
+			stier := opts.stickyTier(imgs[i].msgIdx, imgs[i].hash)
+			if stier <= 0 {
+				continue
+			}
+			if stier >= 5 {
+				if canDrop(i) {
+					snap := makeDroppedSnapshot(&imgs[i])
+					if snap.delta < 0 {
+						versions[i] = append(versions[i], snap)
+						curVer[i] = 1
+						floorVer[i] = 1
+						totalLen += snap.delta
+					}
+				}
+				continue
+			}
+			if raw, mime, encOK := encodeTierCandidate(&imgs[i], stier, &decodeUsed); encOK {
+				snap := makeCompressedSnapshot(&imgs[i], stier, raw, mime)
+				if snap.delta < 0 {
+					versions[i] = append(versions[i], snap)
+					curVer[i] = 1
+					floorVer[i] = 1
+					totalLen += snap.delta
+				}
+			}
+		}
+	}
+
 	curRawLen := func(idx int) int {
 		s := versions[idx][curVer[idx]]
 		if s.kind == snapCompressed {
@@ -681,18 +894,74 @@ func fitImageBudget(to provider.Protocol, body []byte, hardCap, perImageMax int)
 		return 0
 	}
 
+	overPerImg := func(idx int) bool {
+		if opts.perImageMax <= 0 {
+			return false
+		}
+		cur := versions[idx][curVer[idx]]
+		if cur.kind == snapCompressed {
+			return len(cur.raw) > opts.perImageMax
+		}
+		if cur.kind == snapDropped {
+			return false
+		}
+		if imgs[idx].approxRawBytes() <= opts.perImageMax*9/10 {
+			return false
+		}
+		return imgs[idx].ensureOrig() && len(imgs[idx].origRaw) > opts.perImageMax
+	}
+
+	needPerImg := false
+	if opts.perImageMax > 0 {
+		for i := range imgs {
+			if overPerImg(i) {
+				needPerImg = true
+				break
+			}
+		}
+	}
+
+	needTrigger := opts.triggerCap > 0 && totalLen > opts.triggerCap
+	if !needTrigger && !needPerImg {
+		var edits []byteEdit
+		for i := range imgs {
+			snap := versions[i][curVer[i]]
+			if snap.kind == snapOrig {
+				continue
+			}
+			if snap.kind == snapDropped {
+				dropped++
+			}
+			edits = append(edits, snap.edits...)
+			if snap.tier > 0 && imgs[i].hash != ([sha256.Size]byte{}) {
+				updates = append(updates, stickyTierUpdate{msgIdx: imgs[i].msgIdx, hash: imgs[i].hash, tier: snap.tier})
+			}
+		}
+		if len(edits) == 0 {
+			return body, 0, nil, opts.hardCap <= 0 || len(body) <= opts.hardCap
+		}
+		out = applyByteEdits(body, edits)
+		if opts.hardCap > 0 && len(out) > opts.hardCap {
+			return body, 0, nil, false
+		}
+		return out, dropped, updates, true
+	}
+
 	// Phase A: enforce perImageMax for every oversized image.
-	if perImageMax > 0 {
+	if needPerImg {
 		for i := range imgs {
 			if time.Now().After(deadline) {
 				break
 			}
-			if imgs[i].kind == imgKindDropOnly || !imgs[i].ensureOrig() || len(imgs[i].origRaw) <= perImageMax {
+			if !overPerImg(i) || imgs[i].kind == imgKindDropOnly {
 				continue
 			}
 			for tier := 1; tier <= 4; tier++ {
 				if time.Now().After(deadline) {
 					break
+				}
+				if tier <= versions[i][curVer[i]].tier {
+					continue
 				}
 				raw, mime, encOK := encodeTierCandidate(&imgs[i], tier, &decodeUsed)
 				if !encOK {
@@ -702,54 +971,114 @@ func fitImageBudget(to provider.Protocol, body []byte, hardCap, perImageMax int)
 				if len(raw) < curRawLen(i) || snap.delta < versions[i][curVer[i]].delta {
 					applySnap(i, snap)
 				}
-				if curRawLen(i) <= perImageMax {
+				if curRawLen(i) <= opts.perImageMax {
 					break
 				}
 			}
 		}
 	}
 
-	// Phase B: compress through Tiers 1..4 (history first, then protected) while over hardCap.
-	if hardCap > 0 && totalLen > hardCap {
-		for tier := 1; tier <= 4 && totalLen > hardCap; tier++ {
-			for _, protPass := range []bool{false, true} {
-				if totalLen <= hardCap || time.Now().After(deadline) {
-					break
-				}
-				for i := range imgs {
-					if totalLen <= hardCap || time.Now().After(deadline) {
-						break
-					}
-					if imgs[i].isProtected != protPass || imgs[i].kind == imgKindDropOnly {
-						continue
-					}
-					cur := versions[i][curVer[i]]
-					if cur.kind == snapDropped || cur.tier >= tier {
-						continue
-					}
-					raw, mime, encOK := encodeTierCandidate(&imgs[i], tier, &decodeUsed)
-					if !encOK {
-						continue
-					}
-					snap := makeCompressedSnapshot(&imgs[i], tier, raw, mime)
-					if snap.delta < cur.delta {
-						applySnap(i, snap)
-					}
-				}
-			}
+	tryCompress := func(idx, tier int) {
+		if imgs[idx].kind == imgKindDropOnly {
+			return
+		}
+		cur := versions[idx][curVer[idx]]
+		if cur.kind == snapDropped || cur.tier >= tier {
+			return
+		}
+		raw, mime, encOK := encodeTierCandidate(&imgs[idx], tier, &decodeUsed)
+		if !encOK {
+			return
+		}
+		snap := makeCompressedSnapshot(&imgs[idx], tier, raw, mime)
+		if snap.delta < cur.delta {
+			applySnap(idx, snap)
 		}
 	}
 
-	// Phase B2: Tier 5 drops oldest history images (never protected) if still over hardCap.
-	if hardCap > 0 && totalLen > hardCap {
-		for i := range imgs {
-			if totalLen <= hardCap {
+	totalTarget := opts.softTarget
+	if totalTarget <= 0 {
+		totalTarget = opts.hardCap
+	}
+	protCap := opts.protTarget
+	if protCap <= 0 {
+		protCap = opts.hardCap
+	}
+	dropTrig := opts.dropTrigger
+	if dropTrig <= 0 {
+		dropTrig = opts.hardCap
+	}
+
+	compressHistory := (needTrigger || (opts.triggerCap > 0 && totalLen > opts.triggerCap)) && totalTarget > 0 && totalLen > totalTarget
+
+	// Pass 0: Tier 1 lossless PNG metadata optimization on protected current-turn images (0 KV prefix cost).
+	if compressHistory {
+		for i := 0; i < len(imgs) && totalLen > totalTarget; i++ {
+			if time.Now().After(deadline) {
 				break
 			}
-			if imgs[i].isProtected || !validSpan(body, gjson.Result{Index: imgs[i].partAt, Raw: string(body[imgs[i].partAt:imgs[i].partEnd])}) {
+			if imgs[i].isProtected {
+				tryCompress(i, 1)
+			}
+		}
+	}
+
+	// Pass 1: prefix-preserving full-res compression on history images (newest -> oldest, Tier 1 then Tier 2).
+	if compressHistory && totalLen > totalTarget {
+		for i := len(imgs) - 1; i >= 0 && totalLen > totalTarget; i-- {
+			if time.Now().After(deadline) {
+				break
+			}
+			if imgs[i].isProtected {
 				continue
 			}
-			if imgs[i].partEnd-imgs[i].partAt < 1<<10 || imgs[i].dropText == "" {
+			tryCompress(i, 1)
+			if totalLen <= totalTarget {
+				break
+			}
+			tryCompress(i, 2)
+		}
+	}
+
+	// Pass 2: prefix-preserving resize on history images (newest -> oldest, Tier 3 then Tier 4).
+	if compressHistory && totalLen > totalTarget {
+		for i := len(imgs) - 1; i >= 0 && totalLen > totalTarget; i-- {
+			if time.Now().After(deadline) {
+				break
+			}
+			if imgs[i].isProtected {
+				continue
+			}
+			tryCompress(i, 3)
+			if totalLen <= totalTarget {
+				break
+			}
+			tryCompress(i, 4)
+		}
+	}
+
+	// Pass 3: protected lossy fallback (Tiers 2..4) only if still over protCap.
+	if (compressHistory || (opts.hardCap > 0 && totalLen > opts.hardCap)) && protCap > 0 && totalLen > protCap {
+		for tier := 2; tier <= 4 && totalLen > protCap; tier++ {
+			for i := 0; i < len(imgs) && totalLen > protCap; i++ {
+				if time.Now().After(deadline) {
+					break
+				}
+				if imgs[i].isProtected {
+					tryCompress(i, tier)
+				}
+			}
+		}
+	}
+
+	// Pass 4: Tier 5 drops oldest history images down to totalTarget (never protected) if still over dropTrig.
+	if (needTrigger || (opts.hardCap > 0 && totalLen > opts.hardCap)) && dropTrig > 0 && totalLen > dropTrig {
+		dropGoal := totalTarget
+		if dropGoal <= 0 {
+			dropGoal = dropTrig
+		}
+		for i := 0; i < len(imgs) && totalLen > dropGoal; i++ {
+			if !canDrop(i) {
 				continue
 			}
 			cur := versions[i][curVer[i]]
@@ -763,11 +1092,12 @@ func fitImageBudget(to provider.Protocol, body []byte, hardCap, perImageMax int)
 		}
 	}
 
-	if hardCap > 0 && totalLen > hardCap {
-		return body, 0, false
+	if opts.hardCap > 0 && totalLen > opts.hardCap {
+		return body, 0, nil, false
 	}
 
-	// Phase C: stepwise rollback of unnecessary steps in reverse application order.
+	// Phase C: stepwise rollback of unnecessary steps in reverse application order,
+	// capped by rollbackCap (softTarget) and never rolling back below sticky floorVer[i].
 	rawLenForSnap := func(idx int, snap imgSnapshot) int {
 		if snap.kind == snapCompressed {
 			return len(snap.raw)
@@ -780,18 +1110,22 @@ func fitImageBudget(to provider.Protocol, body []byte, hardCap, perImageMax int)
 		}
 		return imgs[idx].approxRawBytes()
 	}
+	rollbackCap := opts.softTarget
+	if rollbackCap <= 0 {
+		rollbackCap = opts.hardCap
+	}
 	for h := len(steps) - 1; h >= 0; h-- {
 		st := steps[h]
-		if curVer[st.imgIdx] != st.newVer {
+		if curVer[st.imgIdx] != st.newVer || st.prevVer < floorVer[st.imgIdx] {
 			continue
 		}
 		prev := versions[st.imgIdx][st.prevVer]
 		cur := versions[st.imgIdx][st.newVer]
-		if perImageMax > 0 && rawLenForSnap(st.imgIdx, prev) > perImageMax {
+		if opts.perImageMax > 0 && rawLenForSnap(st.imgIdx, prev) > opts.perImageMax {
 			continue
 		}
 		newTotal := totalLen + prev.delta - cur.delta
-		if hardCap > 0 && newTotal > hardCap {
+		if rollbackCap > 0 && newTotal > rollbackCap {
 			continue
 		}
 		curVer[st.imgIdx] = st.prevVer
@@ -808,13 +1142,19 @@ func fitImageBudget(to provider.Protocol, body []byte, hardCap, perImageMax int)
 			dropped++
 		}
 		edits = append(edits, snap.edits...)
+		if snap.tier > 0 && imgs[i].hash != ([sha256.Size]byte{}) {
+			updates = append(updates, stickyTierUpdate{msgIdx: imgs[i].msgIdx, hash: imgs[i].hash, tier: snap.tier})
+		}
 	}
 	if len(edits) == 0 {
-		return body, 0, true
+		if opts.hardCap > 0 && len(body) > opts.hardCap {
+			return body, 0, nil, false
+		}
+		return body, 0, nil, true
 	}
 	out = applyByteEdits(body, edits)
-	if hardCap > 0 && len(out) > hardCap {
-		return body, 0, false
+	if opts.hardCap > 0 && len(out) > opts.hardCap {
+		return body, 0, nil, false
 	}
-	return out, dropped, true
+	return out, dropped, updates, true
 }

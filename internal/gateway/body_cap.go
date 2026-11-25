@@ -2,7 +2,9 @@ package gateway
 
 import (
 	"bytes"
+	"cmp"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -180,10 +182,58 @@ func sentLenOf(ctx context.Context) int {
 	return 0
 }
 
+func minPositive(a, b int) int {
+	if a <= 0 {
+		return b
+	}
+	if b <= 0 || a < b {
+		return a
+	}
+	return b
+}
+
+func (s *Server) budgetFitOpts(p provider.Provider, to provider.Protocol, convKey string, body []byte, refitTarget int) budgetFitOptions {
+	var opts budgetFitOptions
+	if refitTarget > 0 {
+		opts = budgetFitOptions{
+			hardCap:     refitTarget,
+			triggerCap:  refitTarget,
+			softTarget:  refitTarget,
+			protTarget:  refitTarget,
+			dropTrigger: refitTarget,
+		}
+	} else {
+		hardCap, perImg := knownBodyCap(p, to, body)
+		n := s.bodyCaps.of(bodyCapKey(p, to))
+		if hardCap > 0 {
+			opts.hardCap = hardCap
+			opts.triggerCap = hardCap
+			opts.softTarget = hardCap * 4 / 5
+			opts.protTarget = hardCap
+			opts.dropTrigger = hardCap
+		}
+		if n > 0 {
+			opts.hardCap = minPositive(opts.hardCap, n)
+			opts.triggerCap = minPositive(opts.triggerCap, capNear(n))
+			opts.softTarget = minPositive(opts.softTarget, capRoom(n))
+			opts.protTarget = minPositive(opts.protTarget, capRoom(n))
+			opts.dropTrigger = minPositive(opts.dropTrigger, capNear(n))
+		}
+		opts.perImageMax = perImg
+	}
+	if (opts.hardCap > 0 || opts.perImageMax > 0) && s.imageStickies.hasConv(p.ID, to, convKey) {
+		opts.stickyTier = func(msgIdx int, hash [sha256.Size]byte) int {
+			return s.imageStickies.get(p.ID, to, convKey, msgIdx, hash)
+		}
+	}
+	return opts
+}
+
 // withinCap is body as it goes to p: fitted under any built-in endpoint cap or
-// learned provider cap when body comes near it.
-func (s *Server) withinCap(p provider.Provider, to provider.Protocol, path string, body []byte) []byte {
-	out, left := s.capFit(p, to, path, body)
+// learned provider cap when body comes near it, returning any sticky tier updates
+// to commit if the upstream responds with success.
+func (s *Server) withinCap(p provider.Provider, to provider.Protocol, path, convKey string, body []byte) ([]byte, []stickyTierUpdate) {
+	out, left, updates := s.capFit(p, to, path, convKey, body)
 	if left > 0 {
 		capBytes := s.bodyCaps.of(bodyCapKey(p, to))
 		if hard, _ := knownBodyCap(p, to, body); hard > 0 && (capBytes == 0 || hard < capBytes) {
@@ -193,34 +243,24 @@ func (s *Server) withinCap(p provider.Provider, to provider.Protocol, path strin
 	} else if len(out) < len(body) {
 		log.Printf("%s: fitted request images from %s to %s", p.Name, mb(len(body)), mb(len(out)))
 	}
-	return out
+	return out, updates
 }
 
 // capFit is withinCap without its log line: body fitted under p's built-in or
-// learned cap, and how many images were left out for it.
-func (s *Server) capFit(p provider.Provider, to provider.Protocol, path string, body []byte) ([]byte, int) {
+// learned cap, how many images were left out for it, and any sticky tier updates.
+func (s *Server) capFit(p provider.Provider, to provider.Protocol, path, convKey string, body []byte) ([]byte, int, []stickyTierUpdate) {
 	if countsTokens(path) {
-		return body, 0
+		return body, 0, nil
 	}
-	hardCap, perImg := knownBodyCap(p, to, body)
-	n := s.bodyCaps.of(bodyCapKey(p, to))
-	target := 0
-	if n > 0 && len(body) > capNear(n) {
-		target = capRoom(n)
+	opts := s.budgetFitOpts(p, to, convKey, body, 0)
+	if opts.stickyTier == nil && opts.hardCap <= 0 && opts.perImageMax <= 0 {
+		return body, 0, nil
 	}
-	if hardCap > 0 && (len(body) > hardCap || perImg > 0) {
-		if target == 0 || hardCap < target {
-			target = hardCap
-		}
-	}
-	if target == 0 && perImg <= 0 {
-		return body, 0
-	}
-	out, left, ok := fitImageBudget(to, body, target, perImg)
+	out, left, updates, ok := fitImageBudgetWithOptions(to, body, opts)
 	if !ok {
-		return body, 0
+		return body, 0, nil
 	}
-	return out, left
+	return out, left, updates
 }
 
 // refitOverCap is forward's answer to res, a refusal of body for its
@@ -231,6 +271,7 @@ func (s *Server) capFit(p provider.Provider, to provider.Protocol, path string, 
 func (s *Server) refitOverCap(ctx context.Context, p provider.Provider, to provider.Protocol, path string, body []byte, in http.Header, res *http.Response) (*http.Response, error) {
 	var err error
 	key := bodyCapKey(p, to)
+	convKey := imageStickyConvKey(provider.Conversation{Session: cmp.Or(sessionOf(in), conversationID(in, body)), Subagent: subOf(in)})
 	for range 3 {
 		if res.StatusCode < 400 || countsTokens(path) {
 			return res, nil
@@ -244,7 +285,7 @@ func (s *Server) refitOverCap(ctx context.Context, p provider.Provider, to provi
 		}
 		sent := sentLenOf(ctx)
 		if sent == 0 {
-			sent = s.capSent(p, to, path, body)
+			sent = s.capSent(p, to, path, convKey, body)
 		}
 		if page && sent < pageCapLeast {
 			return res, nil
@@ -264,9 +305,10 @@ func (s *Server) refitOverCap(ctx context.Context, p provider.Provider, to provi
 		}
 		target := capRoom(n)
 		if hardCap, _ := knownBodyCap(p, to, body); hardCap > 0 && hardCap < target {
-			target = hardCap
+			target = hardCap * 4 / 5
 		}
-		fitted, left, ok := fitImageBudget(to, body, target, 0)
+		opts := s.budgetFitOpts(p, to, convKey, body, target)
+		fitted, left, updates, ok := fitImageBudgetWithOptions(to, body, opts)
 		if !ok || len(fitted) >= sent {
 			res.Body.Close()
 			capVal := statedCap(b, len(body))
@@ -285,13 +327,16 @@ func (s *Server) refitOverCap(ctx context.Context, p provider.Provider, to provi
 		if res, err = s.forwardOnce(ctx, p, to, path, fitted, in); err != nil {
 			return res, err
 		}
+		if res != nil && res.StatusCode < 400 && len(updates) > 0 {
+			s.imageStickies.commit(p.ID, to, convKey, updates)
+		}
 	}
 	if res.StatusCode >= 400 {
 		b := peekError(res)
 		page := !byteCapRefusal(res.StatusCode, b)
 		sent := sentLenOf(ctx)
 		if sent == 0 {
-			sent = s.capSent(p, to, path, body)
+			sent = s.capSent(p, to, path, convKey, body)
 		}
 		if !page || pageOverSize(res.StatusCode, b, len(body)) && sent >= pageCapLeast {
 			// refused as often as it was asked smaller: said as a 413, so
@@ -308,8 +353,8 @@ func (s *Server) refitOverCap(ctx context.Context, p provider.Provider, to provi
 }
 
 // capSent is how many bytes forwardOnce sent for body.
-func (s *Server) capSent(p provider.Provider, to provider.Protocol, path string, body []byte) int {
-	was, _ := s.capFit(p, to, path, codexImagesFit(p, to, body))
+func (s *Server) capSent(p provider.Provider, to provider.Protocol, path, convKey string, body []byte) int {
+	was, _, _ := s.capFit(p, to, path, convKey, codexImagesFit(p, to, body))
 	return len(was)
 }
 

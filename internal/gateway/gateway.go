@@ -603,6 +603,9 @@ type Server struct {
 	// bodyCaps are the byte caps providers refused a request over
 	// (body_cap.go)
 	bodyCaps bodyCaps
+	// imageStickies tracks per-conversation compressed/dropped image tiers
+	// across successful turns so upstream KV prefix caches stay stable.
+	imageStickies imageStickyStore
 	// imageCaps are the image caps a model refused a request over, by
 	// provider id and model (image_cap.go)
 	imageCaps bodyCaps
@@ -6824,9 +6827,11 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 		}
 		body = extra
 	}
+	convKey := imageStickyConvKey(conv)
+	var stickyUpdates []stickyTierUpdate
 	// under any built-in endpoint cap or learned provider cap (body_cap.go),
 	// after ExtraBody so user-injected fields count toward the wire budget
-	body = s.withinCap(p, to, path, body)
+	body, stickyUpdates = s.withinCap(p, to, path, convKey, body)
 	if !countsTokens(path) {
 		// the tier it goes at, the user's own fields in it (#1784)
 		noteWireTier(ctx, to, body)
@@ -7106,6 +7111,9 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 	// and a Copilot account's sealed reasoning, kept by its tool calls
 	heardCopilotOpaque(p, to, body, res)
 	noteSignIn(ctx, p.Account, req, res)
+	if res != nil && res.StatusCode < 400 && len(stickyUpdates) > 0 {
+		s.imageStickies.commit(p.ID, to, convKey, stickyUpdates)
+	}
 	return res, nil
 }
 

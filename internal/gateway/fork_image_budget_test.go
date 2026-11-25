@@ -782,3 +782,342 @@ func TestForkRefitOverCapSingle075StepWhenNoStatedSize(t *testing.T) {
 		t.Fatalf("expected single 0.75x refit step: sent0=%d sent1=%d capRoom=%d", sent0, sent1, capRoom(sent0))
 	}
 }
+
+func TestForkCopilotChat5MiBHysteresisAndMultiTurnPrefixCache(t *testing.T) {
+	mock := setupBudgetCopilot(t, copilotChatHardCap, nil)
+	s := New()
+
+	// Two ~2.13 MB PNG data URLs (730x730 NoCompression -> ~1.60 MB raw each).
+	img0URL := toDataURL("image/png", makeTestOpaquePNG(730, 730, 13, png.NoCompression))
+	img1URL := toDataURL("image/png", makeTestOpaquePNG(730, 730, 29, png.NoCompression))
+
+	m0 := fmt.Sprintf(`{"role":"user","content":[{"type":"text","text":"oldest shot"},{"type":"image_url","image_url":{"url":%q,"detail":"high"}}]}`, img0URL)
+	a0 := `{"role":"assistant","content":"noted shot 0"}`
+	m1 := fmt.Sprintf(`{"role":"user","content":[{"type":"text","text":"newer shot"},{"type":"image_url","image_url":{"url":%q}}]}`, img1URL)
+	a1 := `{"role":"assistant","content":"noted shot 1"}`
+
+	postTurn := func(msgs ...string) {
+		t.Helper()
+		reqBody := fmt.Sprintf(`{"model":"copilot/gemini-4-carbon","messages":[%s]}`, strings.Join(msgs, ","))
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(reqBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Magpie-Session", "sess-hysteresis-1")
+		s.Handler().ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("gateway turn failed: %d %s", rec.Code, rec.Body.String())
+		}
+	}
+
+	// Turn 1: single image < 5 MiB -> untouched byte-for-byte.
+	postTurn(m0)
+
+	// Turn 2: crosses 5 MiB (> 5,242,880 B) -> tail-first compresses M1 down under 4.0 MiB (softTarget),
+	// leaving older M0 untouched byte-for-byte.
+	turn2Text := fmt.Sprintf(`{"role":"user","content":%q}`, "turn2 "+strings.Repeat("b", 1_150_000))
+	postTurn(m0, a0, m1, a1, turn2Text)
+
+	// Turns 3..5: each adds +150 KB pure text (raw request stays > 5 MiB, sticky M1 keeps wire < 5 MiB).
+	msgs := []string{m0, a0, m1, a1, turn2Text, `{"role":"assistant","content":"ok 2"}`}
+	for turn := 3; turn <= 5; turn++ {
+		msgs = append(msgs,
+			fmt.Sprintf(`{"role":"user","content":%q}`, fmt.Sprintf("turn%d %s", turn, strings.Repeat("c", 150_000))),
+			fmt.Sprintf(`{"role":"assistant","content":"ok %d"}`, turn),
+		)
+		postTurn(msgs[:len(msgs)-1]...)
+	}
+
+	calls := mock.asked()
+	if len(calls) != 5 {
+		t.Fatalf("calls = %d, want 5", len(calls))
+	}
+	if !bytes.Contains(calls[0], []byte(img0URL)) {
+		t.Fatalf("Turn 1 (< 5 MiB) modified img0 unexpectedly")
+	}
+	if len(calls[1]) > copilotChatSoftCap {
+		t.Fatalf("Turn 2 expected hysteresis fit <= %d (softTarget), got %d", copilotChatSoftCap, len(calls[1]))
+	}
+	if !bytes.Contains(calls[1], []byte(img0URL)) {
+		t.Fatalf("Turn 2 touched oldest cached img0 instead of compressing newer history img1 first")
+	}
+	m2OnTurn2 := gjson.GetBytes(calls[1], "messages.2").Raw
+	if !strings.Contains(m2OnTurn2, "data:image/jpeg;base64,") {
+		t.Fatalf("expected newer history img1 compressed to JPEG on Turn 2, got %.80s", m2OnTurn2)
+	}
+
+	m0OnTurn2 := gjson.GetBytes(calls[1], "messages.0").Raw
+	for i := 2; i < len(calls); i++ {
+		if len(calls[i]) > copilotChatHardCap {
+			t.Fatalf("Turn %d exceeded 5 MiB hardCap: %d", i+1, len(calls[i]))
+		}
+		if gjson.GetBytes(calls[i], "messages.0").Raw != m0OnTurn2 {
+			t.Fatalf("Turn %d broke prefix at messages[0]", i+1)
+		}
+		if gjson.GetBytes(calls[i], "messages.2").Raw != m2OnTurn2 {
+			t.Fatalf("Turn %d drifted/bounced messages[2] away from Turn 2 sticky wire bytes", i+1)
+		}
+	}
+}
+
+func TestForkImageBudgetStickyFloorPreventsRollbackFlip(t *testing.T) {
+	resetImageBudgetCacheForTest()
+
+	// img0: smooth PNG + text chunk (Tier 1 strips text chunk, Tier 2 JPEG shrinks much smaller).
+	// img1: large uncompressed gradient PNG (Tier 2 JPEG shrinks by > 1.5 MB).
+	img0Raw := makeTestOpaquePNG(500, 500, 19, png.NoCompression,
+		makeRawPNGChunk("tEXt", append([]byte("Meta\x00"), bytes.Repeat([]byte("m"), 40_000)...)))
+	img0URL := toDataURL("image/png", img0Raw)
+	img1URL := toDataURL("image/png", makeTestOpaquePNG(1200, 1200, 23, png.NoCompression))
+
+	body := []byte(fmt.Sprintf(`{"model":"gemini-4-carbon","messages":[`+
+		`{"role":"user","content":[{"type":"image_url","image_url":{"url":%q}}]},`+
+		`{"role":"user","content":[{"type":"image_url","image_url":{"url":%q}}]},`+
+		`{"role":"user","content":"latest question"}`+
+		`]}`, img0URL, img1URL))
+
+	imgs := collectBudgetImages(provider.Chat, body)
+	if len(imgs) != 2 {
+		t.Fatalf("expected 2 images, got %d", len(imgs))
+	}
+	// Simulate img0 already sticky at Tier 2 (JPEG). Compute img0/img1 Tier 2 wire sizes so total
+	// starts above triggerCap before img1 compresses, yet after img1 -> T2 leaves > len(img0URL) room.
+	t2Img0, _, ok0 := encodeTierCandidate(&imgs[0], 2, nil)
+	t2Img1, _, ok1 := encodeTierCandidate(&imgs[1], 2, nil)
+	if !ok0 || !ok1 {
+		t.Fatalf("fixture encode failed (ok0=%v ok1=%v)", ok0, ok1)
+	}
+	afterStickyOnlyLen := len(body) + makeCompressedSnapshot(&imgs[0], 2, t2Img0, "image/jpeg").delta
+	afterBothT2Len := afterStickyOnlyLen + makeCompressedSnapshot(&imgs[1], 2, t2Img1, "image/jpeg").delta
+
+	opts := budgetFitOptions{
+		hardCap:     afterStickyOnlyLen - 10_000,
+		triggerCap:  afterStickyOnlyLen - 10_000,
+		softTarget:  afterStickyOnlyLen - 10_000,
+		protTarget:  afterStickyOnlyLen - 10_000,
+		dropTrigger: afterStickyOnlyLen - 10_000,
+		stickyTier: func(msgIdx int, hash [sha256.Size]byte) int {
+			if msgIdx == 0 && hash == imgs[0].hash {
+				return 2
+			}
+			return 0
+		},
+	}
+	if opts.softTarget-afterBothT2Len <= len(img0URL)-len(t2Img0) {
+		t.Fatalf("expected sufficient slack after img1->T2 so only floorVer prevents img0 rollback (slack=%d)", opts.softTarget-afterBothT2Len)
+	}
+
+	out, dropped, updates, ok := fitImageBudgetWithOptions(provider.Chat, body, opts)
+	if !ok || dropped != 0 || len(out) > opts.hardCap {
+		t.Fatalf("fit failed: ok=%v dropped=%d len=%d hardCap=%d", ok, dropped, len(out), opts.hardCap)
+	}
+	urls := extractChatDataURLs(t, out)
+	if len(urls) != 2 {
+		t.Fatalf("expected 2 images, got %d", len(urls))
+	}
+	if !strings.HasPrefix(urls[0], "data:image/jpeg;base64,") {
+		t.Fatalf("sticky Tier 2 on img0 bounced back! got %.50s", urls[0])
+	}
+	var gotTier0 int
+	for _, u := range updates {
+		if u.msgIdx == 0 {
+			gotTier0 = u.tier
+		}
+	}
+	if gotTier0 < 2 {
+		t.Fatalf("expected sticky update tier >= 2 for img0, got %d", gotTier0)
+	}
+}
+
+func TestForkImageBudgetStickyIsolationAndFailedAttemptNoPoison(t *testing.T) {
+	fresh(t)
+	resetImageBudgetCacheForTest()
+
+	imgURL := toDataURL("image/png", makeTestOpaquePNG(640, 640, 37, png.NoCompression))
+
+	var mu sync.Mutex
+	var failNext bool
+	var calls [][]byte
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/models":
+			io.WriteString(w, `{"data":[{"id":"gemini-4-carbon","name":"Gemini 4 Carbon","model_picker_enabled":true,"policy":{"state":"enabled"},"supported_endpoints":["/chat/completions"],"capabilities":{"type":"chat","supports":{}}}]}`)
+		case "/chat/completions":
+			b, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			calls = append(calls, b)
+			fail := failNext
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			if fail {
+				w.WriteHeader(http.StatusInternalServerError)
+				io.WriteString(w, `{"error":{"message":"upstream hiccup"}}`)
+				return
+			}
+			io.WriteString(w, `{"id":"chat_ok","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"OK"},"finish_reason":"stop"}]}`)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	t.Cleanup(api.Close)
+
+	cfg := os.Getenv("XDG_CONFIG_HOME")
+	os.MkdirAll(filepath.Join(cfg, "github-copilot"), 0o755)
+	os.WriteFile(filepath.Join(cfg, "github-copilot", "apps.json"), mustJSON(map[string]any{
+		"github.com:Iv1.x": map[string]any{"user": "alice", "oauth_token": "gho_alice"},
+	}), 0o600)
+	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/token") {
+			json.NewEncoder(w).Encode(map[string]any{"token": "sess", "expires_at": time.Now().Add(time.Hour).Unix(), "endpoints": map[string]string{"api": api.URL}})
+			return
+		}
+		io.WriteString(w, `{"copilot_plan":"individual"}`)
+	}))
+	t.Cleanup(gh.Close)
+	oldTok, oldUser := provider.CopilotTokenURL, provider.CopilotUserURL
+	provider.CopilotTokenURL, provider.CopilotUserURL = gh.URL+"/token", gh.URL+"/user"
+	t.Cleanup(func() { provider.CopilotTokenURL, provider.CopilotUserURL = oldTok, oldUser })
+
+	s := New()
+	send := func(sess string, body []byte) int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Magpie-Session", sess)
+		s.Handler().ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	lastCall := func() []byte {
+		mu.Lock()
+		defer mu.Unlock()
+		return calls[len(calls)-1]
+	}
+
+	// 1. Failing upstream (HTTP 500, even across retries) on > 5 MiB request MUST NOT commit sticky tier.
+	mu.Lock()
+	failNext = true
+	mu.Unlock()
+	overBody := []byte(fmt.Sprintf(`{"model":"copilot/gemini-4-carbon","messages":[`+
+		`{"role":"user","content":[{"type":"image_url","image_url":{"url":%q}}]},`+
+		`{"role":"user","content":%q}]}`, imgURL, strings.Repeat("p", copilotChatHardCap-len(imgURL)+200_000)))
+	if code := send("sess-fail", overBody); code != 500 {
+		t.Fatalf("expected 500, got %d", code)
+	}
+
+	mu.Lock()
+	failNext = false
+	mu.Unlock()
+	underSameSess := []byte(fmt.Sprintf(`{"model":"copilot/gemini-4-carbon","messages":[`+
+		`{"role":"user","content":[{"type":"image_url","image_url":{"url":%q}}]},`+
+		`{"role":"user","content":"small follow-up"}]}`, imgURL))
+	if code := send("sess-fail", underSameSess); code != 200 {
+		t.Fatalf("expected 200, got %d", code)
+	}
+	if !bytes.Contains(lastCall(), []byte(imgURL)) {
+		t.Fatalf("failed HTTP 500 turn poisoned sticky state for sess-fail")
+	}
+
+	// 2. Successful > 5 MiB request on sess-a commits sticky tier on msgIdx=0;
+	// sess-b sending same imgURL < 5 MiB MUST remain untouched;
+	// sess-a re-pasting same imgURL at msgIdx=2 keeps msgIdx=0 sticky and msgIdx=2 original!
+	if code := send("sess-a", overBody); code != 200 {
+		t.Fatalf("expected 200 for sess-a overBody, got %d", code)
+	}
+	if code := send("sess-b", underSameSess); code != 200 {
+		t.Fatalf("expected 200 for sess-b, got %d", code)
+	}
+	sessBCall := lastCall()
+	repasted := []byte(fmt.Sprintf(`{"model":"copilot/gemini-4-carbon","messages":[`+
+		`{"role":"user","content":[{"type":"image_url","image_url":{"url":%q}}]},`+
+		`{"role":"assistant","content":"ack"},`+
+		`{"role":"user","content":[{"type":"image_url","image_url":{"url":%q}}]}]}`, imgURL, imgURL))
+	if code := send("sess-a", repasted); code != 200 {
+		t.Fatalf("expected 200 for sess-a repasted, got %d", code)
+	}
+	sessARepasteCall := lastCall()
+
+	if !bytes.Contains(sessBCall, []byte(imgURL)) {
+		t.Fatalf("sess-a sticky tier leaked to sess-b")
+	}
+	urls := extractChatDataURLs(t, sessARepasteCall)
+	if len(urls) != 2 {
+		t.Fatalf("expected 2 images in repaste call, got %d", len(urls))
+	}
+	if urls[0] == imgURL {
+		t.Fatalf("expected sess-a msgIdx=0 to stay sticky compressed")
+	}
+	if urls[1] != imgURL {
+		t.Fatalf("expected newly pasted sess-a msgIdx=2 to start fresh uncompressed")
+	}
+}
+
+func TestForkImageBudgetSoftTargetUnreachableStillMeetsHardCap(t *testing.T) {
+	resetImageBudgetCacheForTest()
+
+	imgURL := toDataURL("image/png", makeTestOpaquePNG(520, 520, 17, png.NoCompression))
+	// 4.35 MiB of uncompressible text + ~1.08 MiB PNG -> ~5.43 MiB (> 5.0 MiB hardCap).
+	// Compressing image drops total to ~4.39 MiB: still > 4.0 MiB softTarget, but <= 5.0 MiB hardCap!
+	hugeText := strings.Repeat("t", 4_550_000)
+	body := []byte(fmt.Sprintf(`{"model":"gemini-4-carbon","messages":[`+
+		`{"role":"user","content":[{"type":"image_url","image_url":{"url":%q}}]},`+
+		`{"role":"user","content":%q}]}`, imgURL, hugeText))
+
+	out, dropped, _, ok := fitImageBudgetWithOptions(provider.Chat, body, budgetFitOptions{
+		hardCap:     copilotChatHardCap,
+		triggerCap:  copilotChatHardCap,
+		softTarget:  copilotChatSoftCap,
+		protTarget:  copilotChatHardCap,
+		dropTrigger: copilotChatHardCap,
+		perImageMax: copilotChatPerImageMax,
+	})
+	if !ok {
+		t.Fatalf("expected ok=true when total <= hardCap despite exceeding softTarget")
+	}
+	if dropped != 0 {
+		t.Fatalf("expected dropped=0 (no Tier 5 drop once <= hardCap), got %d", dropped)
+	}
+	if len(out) > copilotChatHardCap || len(out) <= copilotChatSoftCap {
+		t.Fatalf("unexpected len(out)=%d (want between %d and %d)", len(out), copilotChatSoftCap, copilotChatHardCap)
+	}
+}
+
+func TestForkImageBudgetProtectedLosslessBeforeHistoryTouch(t *testing.T) {
+	resetImageBudgetCacheForTest()
+
+	histURL := toDataURL("image/png", makeTestOpaquePNG(450, 450, 31, png.BestCompression))
+	protJunk := makeRawPNGChunk("tEXt", append([]byte("Comment\x00"), bytes.Repeat([]byte("z"), 1_150_000)...))
+	protURL := toDataURL("image/png", makeTestOpaquePNG(240, 240, 41, png.BestCompression, protJunk))
+
+	// Construct body right above 5 MiB so stripping prot's metadata chunk alone brings it <= 4.0 MiB softTarget.
+	prefix := fmt.Sprintf(`{"model":"gemini-4-carbon","messages":[`+
+		`{"role":"user","content":[{"type":"image_url","image_url":{"url":%q}}]},`+
+		`{"role":"user","content":[{"type":"image_url","image_url":{"url":%q}},{"type":"text","text":"`, histURL, protURL)
+	suffix := `"}]}]}`
+	pad := (copilotChatHardCap + 50_000) - len(prefix) - len(suffix)
+	if pad < 0 {
+		t.Fatalf("unexpected negative pad %d", pad)
+	}
+	body := []byte(prefix + strings.Repeat("w", pad) + suffix)
+
+	out, dropped, _, ok := fitImageBudgetWithOptions(provider.Chat, body, budgetFitOptions{
+		hardCap:     copilotChatHardCap,
+		triggerCap:  copilotChatHardCap,
+		softTarget:  copilotChatSoftCap,
+		protTarget:  copilotChatHardCap,
+		dropTrigger: copilotChatHardCap,
+		perImageMax: copilotChatPerImageMax,
+	})
+	if !ok || dropped != 0 || len(out) > copilotChatSoftCap {
+		t.Fatalf("Pass 0 protected lossless failed: ok=%v dropped=%d len=%d softCap=%d", ok, dropped, len(out), copilotChatSoftCap)
+	}
+	urls := extractChatDataURLs(t, out)
+	if len(urls) != 2 {
+		t.Fatalf("expected 2 images, got %d", len(urls))
+	}
+	if urls[0] != histURL {
+		t.Fatalf("Pass 0 should leave cached history image untouched when protected Tier 1 reaches softTarget")
+	}
+	if !strings.HasPrefix(urls[1], "data:image/png;base64,") {
+		t.Fatalf("expected protected image to remain lossless PNG, got %.40s", urls[1])
+	}
+}
