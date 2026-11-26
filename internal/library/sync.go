@@ -308,6 +308,24 @@ func (l *Library) syncMCP(t *Target, b *backups, res *Result) {
 			res.dropped = append(res.dropped, had)
 		}
 	}
+	// an entry of the agent's own under the name of a server the hub now
+	// gives it would put that server's tools in front of the agent twice,
+	// once whole beside the hub's (Col0urfu1_ on X: context went up with
+	// the router on). With the router off magpie writes the Library's
+	// server over that entry, so with it on the entry goes, kept in the
+	// backup as then. One magpie wrote for another agent sharing the file
+	// stays that agent's
+	if hub != nil && !t.Gone {
+		for _, s := range l.MCP {
+			if !slices.Contains(s.Agents, id) || !hubbed(s) || s.Name == HubEntry || slices.Contains(a.MCP, s.Name) {
+				continue
+			}
+			if e, ok := entries[s.Name]; !ok || t.MCP.foreign(e) != nil || l.sharerWrote(t, s.Name) {
+				continue
+			}
+			write("mcp:"+s.Name, func() error { return t.MCP.del(s.Name) })
+		}
+	}
 	given := []*Server{}
 	for _, s := range l.MCP {
 		if slices.Contains(s.Agents, id) && !hubbed(s) {
@@ -555,6 +573,10 @@ type AgentView struct {
 	// Gone: not installed here any more, and listed only for what magpie
 	// gave it to be taken out (held); it is given nothing new
 	Gone bool `json:"gone,omitempty"`
+	// Remote: not on this computer, and connected to the MCP router at its
+	// own address from another one (remote_agents.go): it is given the
+	// router's servers alone, and magpie writes nothing for it
+	Remote bool `json:"remote,omitempty"`
 	// Asleep is the WSL distro, not running now, the agent is in: it is
 	// listed by what magpie last knew of it (wsl_asleep.go), and a change
 	// for it is written there when the distro next runs. Unseen: magpie
@@ -891,6 +913,8 @@ func readView(problems []Problem, glance bool) (*View, error) {
 			v.Agents = append(v.Agents, av)
 		}
 	}
+	// an agent on another computer using the router (remote_agents.go)
+	v.Agents = append(v.Agents, l.remoteViews(v.Agents)...)
 	of := func(what string) map[string]string {
 		m := map[string]string{}
 		for _, p := range problems {
@@ -1120,7 +1144,7 @@ func serversAgents(names, agents []string, on bool) (*Result, error) {
 		}
 		var r reach
 		if on {
-			r = reachNow()
+			r = reachNow(l)
 		}
 		for _, s := range l.MCP {
 			if names != nil && !slices.Contains(names, s.Name) {
@@ -1146,14 +1170,16 @@ func serversAgents(names, agents []string, on bool) (*Result, error) {
 }
 
 // reach is which agents a server can be given: those whose MCP file
-// supports it, and a stopped distro's by what magpie last knew of them.
+// supports it, a stopped distro's by what magpie last knew of them, and
+// one on another computer (remote_agents.go) any the router serves.
 type reach struct {
 	mcp    map[string]*mcpFile
 	shapes map[string]*shape
+	remote []string
 	order  []string // every agent it knows, as found
 }
 
-func reachNow() reach {
+func reachNow(l *Library) reach {
 	r := reach{mcp: map[string]*mcpFile{}, shapes: map[string]*shape{}}
 	ts, asleep := targetsAsleep(false)
 	for _, t := range ts {
@@ -1168,11 +1194,18 @@ func reachNow() reach {
 			r.order = append(r.order, a.ID)
 		}
 	}
+	for _, id := range l.RemoteAgents {
+		if r.mcp[id] == nil && r.shapes[id] == nil {
+			r.remote = append(r.remote, id)
+			r.order = append(r.order, id)
+		}
+	}
 	return r
 }
 
 func (r reach) takes(a string, s *Server) bool {
-	return r.mcp[a] != nil && r.mcp[a].supports(s) == nil || r.shapes[a] != nil && r.shapes[a].reaches(s)
+	return r.mcp[a] != nil && r.mcp[a].supports(s) == nil || r.shapes[a] != nil && r.shapes[a].reaches(s) ||
+		slices.Contains(r.remote, a) && inHub(s, a)
 }
 
 // RemoveServer takes a server out of the library and out of every agent

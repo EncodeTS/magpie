@@ -136,7 +136,9 @@ type Provider struct {
 	// The window can be shorter than a week. "weight" by each key's
 	// weight, a key with 3 taking three requests to one with 1's.
 	// "drain" one until it is used up, then the next, which keeps them
-	// when an earlier one renews (routes.Drain). Whichever it is, one out
+	// when an earlier one renews (routes.Drain). "pace-drain" picks as
+	// "pace" does and then stays on it as "drain" does until it is used
+	// up (routes.PaceDrain). Whichever it is, one out
 	// of credit, out of quota, rate limited or failing is passed over for
 	// as long as that lasts.
 	Routing string `json:"routing,omitempty"`
@@ -539,6 +541,14 @@ type Provider struct {
 	// TakesResolve is; a plugin's requests are made by its host, which has
 	// no way to be told. See netproxy.WithResolve and CheckResolve.
 	Resolve map[string][]string `json:"resolve,omitempty"`
+	// Addresses are a Remote magpie's other addresses: the same
+	// computer's magpie reached another way (evjohnicu on X: at home its
+	// LAN address, from outside through Tailscale or EasyTier). A request
+	// goes to the one that last answered first, and to the next when it
+	// takes no connection; an answer, a refusal too, is the remote's own.
+	// Each is a root as the base URL is (remoteMagpieEndpoints). See
+	// netproxy.WithFailover.
+	Addresses []string `json:"addresses,omitempty"`
 
 	// Proxy is the proxy magpie's requests to this provider go through
 	// (#237: Codex through one, a vendor at home without): "" follows
@@ -650,6 +660,11 @@ type Provider struct {
 	// BalanceURL (see TakesBalanceToken). It is asked with nothing else but
 	// the provider's headers, when the endpoint is one named.
 	BalanceToken string `json:"balanceToken,omitempty"`
+	// KeyBalanceAuth is, by KeyID, the access token and user id of the
+	// account a key belongs to, where it isn't BalanceToken's (keys of two
+	// accounts at one relay): that key's balance is asked with them (see
+	// key_balance_auth.go). A key not in it is asked as the provider says.
+	KeyBalanceAuth map[string]KeyBalanceAuth `json:"keyBalanceAuth,omitempty"`
 	// ZhipuTeam, for a Zhipu or Z.ai key on a team's GLM Coding Plan, is
 	// the team's organization and project, from the BigModel console: the
 	// team's windows are told to the key only with them (see
@@ -795,6 +810,10 @@ type file struct {
 	// Searches are the web search APIs a model's search goes to when no
 	// provider can search (see search_api.go).
 	Searches []SearchAPI `json:"searches,omitempty"`
+	// SearchesSet: Searches has held a search API, so an empty one is the
+	// user's (they removed the last); magpie adds none of its own then
+	// (AdoptSignedInSearch). Kept from the read on, whatever is stored.
+	SearchesSet bool `json:"searchesSet,omitempty"`
 	// NoAutoGroups: the user turned off the groups magpie finds on its
 	// own (SetAutoGroups); the groups they made or changed stay.
 	NoAutoGroups bool `json:"noAutoGroups,omitempty"`
@@ -803,6 +822,12 @@ type file struct {
 	// their models are in none, so a model only one other provider serves
 	// is no group. The groups the user made or changed keep them.
 	AutoGroupSkip []string `json:"autoGroupSkip,omitempty"`
+	// AutoGroupsOfOne: the user asked for a group of a model only one
+	// provider serves too (SetAutoGroupsOfOne; realLemonawa on X), so
+	// auto/<model> is there before a second provider lists it and stays
+	// when one goes. Off, as it is unless set, a found group is a model
+	// two or more providers serve.
+	AutoGroupsOfOne bool `json:"autoGroupsOfOne,omitempty"`
 	// Order is the order the user put the providers in on the Providers
 	// tab (#499), by id; one not in it follows those that are, in the
 	// order it was added (see SetOrder).
@@ -900,6 +925,7 @@ func read() (file, error) {
 			return file{}, &unreadableError{Path(), err}
 		}
 	}
+	f.SearchesSet = f.SearchesSet || len(f.Searches) > 0
 	return f, nil
 }
 
@@ -959,14 +985,21 @@ func store(f file) error {
 	for i := range f.Groups {
 		f.Groups[i] = f.Groups[i].stored()
 	}
+	f.SearchesSet = f.SearchesSet || len(f.Searches) > 0
 	b, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := lastgood.Keep(p, validProviders, 0o600); err != nil {
+	// a file edited by hand that doesn't parse is the user's, left as it
+	// is: read gave its last good generation, and writing that with this
+	// change over it lost the edit (sarosaka1023 on X)
+	if err := lastgood.KeepEdited(p, validProviders, 0o600); err != nil {
+		if e := (*lastgood.EditedError)(nil); errors.As(err, &e) {
+			return &unreadableError{p, errors.New(e.Why)}
+		}
 		return err
 	}
-	if err := writePrivate(p, append(b, '\n')); err != nil {
+	if err := writeStored(p, append(b, '\n')); err != nil {
 		return err
 	}
 	pruneIcons(f)
@@ -1039,6 +1072,7 @@ func (p Provider) clone() Provider {
 	p.KeyOwnBalances = maps.Clone(p.KeyOwnBalances)
 	p.KeyPriceRates = maps.Clone(p.KeyPriceRates)
 	p.KeyRateFactors = maps.Clone(p.KeyRateFactors)
+	p.KeyBalanceAuth = maps.Clone(p.KeyBalanceAuth)
 	if p.AccountWindowCaps != nil {
 		m := make(map[string]map[string]int, len(p.AccountWindowCaps))
 		for k, v := range p.AccountWindowCaps {
@@ -1375,6 +1409,9 @@ func Save(p Provider) error {
 			}
 			p.Resolve = r
 		}
+		if err := p.checkAddresses(); err != nil {
+			return err
+		}
 		if p.HTTP1 && !p.TakesInsecureTLS() {
 			return fmt.Errorf("%s is a preset's: only a provider you added with your own base URL can be held to HTTP/1.1", p.Name)
 		}
@@ -1417,6 +1454,7 @@ func Save(p Provider) error {
 	if i >= 0 {
 		was = &f.Providers[i]
 	}
+	p.Models, p.Delisted = goneKeptAside(p, was)
 	p.PickedFrom = listedWith(p, was)
 	p.Delisted = delistedWith(p, was)
 	p.DelistedAt = delistedAtWith(p, was)
@@ -1479,6 +1517,45 @@ func delistedWith(p Provider, was *Provider) []string {
 		return nil
 	}
 	return d
+}
+
+// goneKeptAside are p's Models and Delisted with a remote magpie's pick its
+// list set aside kept aside while that list still lacks it. Another
+// magpie's list is followed in the background: an editor opened before it
+// dropped a routing group still held the group among its picks, and its
+// Save picked it again (delistedWith), where no later fetch could tell it
+// from one typed by hand, so the group stayed in this magpie's list for
+// good (CryptoSarom on X). It comes back with a list that has it
+// (relistPicks). A pick typed by hand was never set aside, and stays.
+func goneKeptAside(p Provider, was *Provider) ([]string, []string) {
+	if was == nil || len(was.Delisted) == 0 || len(p.Models) == 0 || !p.IsRemoteMagpie() {
+		return p.Models, p.Delisted
+	}
+	now := liveIDs(p.ID)
+	if len(now) == 0 {
+		return p.Models, p.Delisted // no list to tell by
+	}
+	var kept, aside []string
+	for _, m := range p.Models {
+		if slices.Contains(was.Delisted, m) && !now[m] {
+			aside = append(aside, m)
+		} else {
+			kept = append(kept, m)
+		}
+	}
+	if len(aside) == 0 {
+		return p.Models, p.Delisted
+	}
+	d := p.Delisted
+	if d == nil {
+		d = slices.Clone(was.Delisted)
+	}
+	for _, m := range aside {
+		if !slices.Contains(d, m) {
+			d = append(d, m)
+		}
+	}
+	return kept, d
 }
 
 // delistedAtWith is what p.DelistedAt is saved as: zero while some pick is
@@ -1612,6 +1689,10 @@ func AddCopy(p Provider, from string) (string, error) {
 		// and show its balance twice, the copy's own account never asked.
 		if p.BalanceToken == "" {
 			p.BalanceToken = src.BalanceToken
+		}
+		// each key's own, likewise
+		if p.KeyBalanceAuth == nil {
+			p.KeyBalanceAuth = maps.Clone(src.KeyBalanceAuth)
 		}
 	}
 	// the access key as the copy's editor showed it: the form sends its ID
@@ -1924,6 +2005,7 @@ func normalize(p Provider) Provider {
 	p.KeyOwnBalances = normalKeyOwnBalances(p.KeyOwnBalances)
 	p.KeyPriceRates = normalKeyPriceRates(p.KeyPriceRates)
 	p.KeyRateFactors = normalKeyRateFactors(p.KeyRateFactors)
+	p.KeyBalanceAuth = normalKeyBalanceAuth(p.KeyBalanceAuth, p)
 	if TopUpRateOK(p.TopUpRate) != "" {
 		p.TopUpRate = 0
 	}
@@ -2003,10 +2085,11 @@ func normalize(p Provider) Provider {
 	if anon := p.AnonymousKey(); anon != "" && p.Key == "" {
 		p.Key = anon
 	}
-	// a Zen provider saved before its preset had System One for Jev
-	// (01huadalang: its Jev was asked as a chat model, and failed), an
-	// OpenRouter one before its decision models were listed (ARNO)
-	if (p.Preset == "opencode-zen" || p.Preset == "openrouter") && p.Decide == "" && p.Chat != "" {
+	// a Zen or Go provider saved before its preset had System One for its
+	// decision models (01huadalang: Zen's Jev was asked as a chat model,
+	// and failed), an OpenRouter one before its decision models were listed
+	// (ARNO)
+	if (p.Preset == "opencode-zen" || p.Preset == "opencode-go" || p.Preset == "openrouter") && p.Decide == "" && p.Chat != "" {
 		if pr := Preset(p.Preset); pr != nil {
 			p.Decide = pr.Decide
 		}
@@ -2031,7 +2114,7 @@ func normalize(p Provider) Provider {
 	if p.Decide == "" {
 		p.Decide = p.googleDecisions()
 	}
-	if p.Routing != Ordered && p.Routing != Rotate && p.Routing != LeastUsed && p.Routing != Pace && p.Routing != Weighted && p.Routing != FreeFirst && p.Routing != Fastest && p.Routing != Drain && !PluginRouting(p.Routing) {
+	if p.Routing != Ordered && p.Routing != Rotate && p.Routing != LeastUsed && p.Routing != Pace && p.Routing != Weighted && p.Routing != FreeFirst && p.Routing != Fastest && p.Routing != Drain && p.Routing != PaceDrain && !PluginRouting(p.Routing) {
 		p.Routing = ""
 	}
 	if !slices.Contains(Affinities, p.Affinity) {

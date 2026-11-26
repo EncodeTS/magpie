@@ -137,9 +137,10 @@ type ClassifierTry struct {
 // next one: it is down, refused, rested or out of time. Not an answer
 // that wasn't a number (answerError): it is up, and its next answer is
 // as likely to be one, so a second paid ask buys nothing; and not an
-// intent said with its effort lost (effortFailed), which holds.
+// intent said with its effort lost (effortFailed), which holds, nor an
+// effort rated with the intent declined (intentFailed), which holds too.
 func failsOver(err error) bool {
-	return err != nil && !errors.As(err, new(answerError)) && !errors.As(err, new(effortFailed))
+	return err != nil && !errors.As(err, new(answerError)) && !errors.As(err, new(effortFailed)) && !errors.As(err, new(intentFailed))
 }
 
 type turnRule struct {
@@ -359,7 +360,7 @@ func ruleFor(key string, g provider.Group, ms []provider.Member, req *Request, a
 		if had && slices.Contains(intents, tr.intent) {
 			c.After = tr.intent // a message that only carries on is of its kind
 		}
-		prev := before{Intent: c.After}
+		prev := before{Intent: c.After, Prompt: g.ClassifyPrompt} // the group's own instructions, when it has them
 		if had && effort {
 			prev.Effort = tr.effort // and needs the reasoning it had
 			c.AfterEffort = tr.effort
