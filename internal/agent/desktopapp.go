@@ -266,6 +266,17 @@ func storePackages() []string {
 	return installedWindowsStorePackages()
 }
 
+// windowsStorePackageRoot returns the installed PackageRootFolder for a
+// Windows Store package full name, "" elsewhere or in isolated tests.
+var windowsStorePackageRoot = storePackageRoot
+
+func storePackageRoot(pkg string) string {
+	if proc.Isolated() || pkg == "" {
+		return ""
+	}
+	return installedWindowsStorePackageRoot(pkg)
+}
+
 // windowsRegisteredApp is the folder and version an installer registered
 // the app with guid under on Windows (registeredIn), "" elsewhere or when
 // none is; a var so tests never read the machine's own registry.
@@ -720,9 +731,13 @@ func (app desktopApp) registered() (dir, version string) {
 // keeps a resource package (…_neutral_split.scale-125_…) of a version the
 // main package has moved past, so one is no sign the app is installed.
 func storeAppVersion(packages []string, name, publisher string) string {
+	_, version := storeAppPackage(packages, name, publisher)
+	return version
+}
+
+func storeAppPackage(packages []string, name, publisher string) (pkgName, found string) {
 	prefix, suffix := name+"_", "_"+publisher
 	var newest [4]uint64
-	found := ""
 	for _, pkg := range packages {
 		if !strings.HasPrefix(pkg, prefix) || !strings.HasSuffix(pkg, suffix) {
 			continue
@@ -746,10 +761,10 @@ func storeAppVersion(packages []string, name, publisher string) string {
 			}
 		}
 		if valid && (found == "" || slices.Compare(version[:], newest[:]) > 0) {
-			newest, found = version, fields[0]
+			newest, pkgName, found = version, pkg, fields[0]
 		}
 	}
-	return found
+	return pkgName, found
 }
 
 // HasApp reports whether the agent's desktop app is installed here: its

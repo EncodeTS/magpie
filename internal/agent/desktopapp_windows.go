@@ -19,6 +19,19 @@ func installedWindowsStorePackages() []string {
 	return names
 }
 
+func installedWindowsStorePackageRoot(pkg string) string {
+	if pkg == "" {
+		return ""
+	}
+	key, err := registry.OpenKey(registry.CURRENT_USER, appxPackagesKey+`\`+pkg, registry.QUERY_VALUE)
+	if err != nil {
+		return ""
+	}
+	defer key.Close()
+	v, _, _ := key.GetStringValue("PackageRootFolder")
+	return v
+}
+
 // registeredWindowsApp reads what an electron-builder installer
 // registered for the app with guid (registeredIn), for the current user
 // or for all users, in the 64-bit view and then the 32-bit one.

@@ -81,8 +81,8 @@ var codexReaders = func(at place) []CodexReader {
 			}
 		}
 	case "windows":
-		if storeAppVersion(windowsStorePackages(), app.store, app.publisher) != "" {
-			out = append(out, CodexReader{Kind: "app"})
+		if pkg, v := storeAppPackage(windowsStorePackages(), app.store, app.publisher); v != "" {
+			out = append(out, CodexReader{Kind: "app", Version: windowsStoreCodexVersion(pkg)})
 		}
 	case "linux":
 		if dir := app.linuxDir(); dir != "" {
@@ -164,6 +164,25 @@ func bundledCodexVersion(bundle, id string) (v string, ok bool) {
 	}
 	m := plistIDRe.FindSubmatch(b)
 	return "", m != nil && strings.TrimSpace(string(m[1])) == id
+}
+
+func windowsStoreCodexVersion(pkg string) string {
+	root := windowsStorePackageRoot(pkg)
+	if root == "" {
+		return ""
+	}
+	for _, rel := range []string{
+		filepath.Join("app", "resources", "codex.exe"),
+		filepath.Join("resources", "codex.exe"),
+	} {
+		bin := filepath.Join(root, rel)
+		if isFile(bin) {
+			if v := installedVersion(bin); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
 }
 
 // codexAsyncBlocked are the readers that keep the table out: one older
