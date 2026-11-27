@@ -221,6 +221,13 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      - name: Checkout git history for release notes
+        if: needs.prepare.outputs.publish == 'true'
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
       - name: Download macOS arm64 artifacts
         uses: actions/download-artifact@v7
         with:
@@ -287,18 +294,76 @@ jobs:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          notes=$(sed 's/^          //' <<EOF
-          Personal fork build \`${VERSION}\` (macOS arm64 & Windows x64 only).
+          node -e '
+            const fs = require("node:fs");
+            const { execFileSync } = require("node:child_process");
 
-          - macOS app bundle is ad-hoc signed (\`codesign --sign -\`, not notarised). After moving \`magpie.app\` to \`/Applications\`, clear quarantine if Gatekeeper prompts:
-            \`xattr -dr com.apple.quarantine /Applications/magpie.app\`
-          - Self-updates point to \`EncodeTS/magpie\` Releases (verified with the fork Ed25519 key and GitHub SLSA build attestations); official \`usemagpie.ai\` / \`yetone/magpie-releases\` overwrites remain blocked.
-          EOF
-          )
+            const tag = process.env.TAG || "";
+            const version = process.env.VERSION || "";
+            const sha = process.env.GITHUB_SHA || "HEAD";
+            const zhMarker = "<!-- lang:zh -->";
+
+            const git = (args) => {
+              try {
+                return execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+              } catch {
+                return "";
+              }
+            };
+
+            const installEn = [
+              "## Install",
+              "",
+              `Personal fork build \`${version}\` (macOS arm64 & Windows x64 only).`,
+              "",
+              "- macOS app bundle is ad-hoc signed (`codesign --sign -`, not notarised). After moving `magpie.app` to `/Applications`, clear quarantine if Gatekeeper prompts:",
+              "  `xattr -dr com.apple.quarantine /Applications/magpie.app`",
+              "- Self-updates point to `EncodeTS/magpie` Releases (verified with the fork Ed25519 key and GitHub SLSA build attestations); official `usemagpie.ai` / `yetone/magpie-releases` overwrites remain blocked.",
+            ].join("\n");
+
+            const installZh = [
+              "## 安装",
+              "",
+              `个人 Fork 构建 \`${version}\`（仅含 macOS arm64 与 Windows x64）。`,
+              "",
+              "- macOS 应用包使用本地自签名（`codesign --sign -`，未公证）；拖入 `/Applications` 后如 Gatekeeper 提示，可执行：",
+              "  `xattr -dr com.apple.quarantine /Applications/magpie.app`",
+              "- 自动更新指向 `EncodeTS/magpie` Releases（经由 Fork Ed25519 密钥与 GitHub SLSA 构建证明双重校验）；官方 `usemagpie.ai` / `yetone/magpie-releases` 覆盖仍会被拦截。",
+            ].join("\n");
+
+            let raw = "";
+            if (tag && git(["for-each-ref", "--format=%(objecttype)", `refs/tags/${tag}`]) === "tag") {
+              raw = git(["for-each-ref", "--format=%(contents)", `refs/tags/${tag}`]);
+            }
+            if (!raw) {
+              const prev = git(["describe", "--tags", "--abbrev=0", "--match", "fork-v*", `${sha}^`]);
+              let log = prev
+                ? git(["log", "--first-parent", "--format=- %s (`%h`)", `${prev}..${sha}`])
+                : git(["log", "-1", "--format=- %s (`%h`)", sha]);
+              if (!log) log = git(["log", "-1", "--format=- %s (`%h`)", sha]);
+              raw = prev ? `Changes since \`${prev}\`:\n\n${log}` : log;
+            }
+
+            let finalNotes = "";
+            const idx = raw.indexOf(zhMarker);
+            if (idx >= 0) {
+              let enPart = raw.slice(0, idx).trim();
+              let zhPart = raw.slice(idx + zhMarker.length).trim();
+              if (!/^##\s+Install\b/im.test(enPart)) enPart = enPart ? `${enPart}\n\n${installEn}` : installEn;
+              if (!/^##\s+安装\b/m.test(zhPart)) zhPart = zhPart ? `${zhPart}\n\n${installZh}` : installZh;
+              finalNotes = `${enPart}\n\n${zhMarker}\n\n${zhPart}\n`;
+            } else {
+              let enPart = raw.trim();
+              if (!/^##\s+Install\b/im.test(enPart)) enPart = enPart ? `${enPart}\n\n${installEn}` : installEn;
+              finalNotes = `${enPart}\n`;
+            }
+
+            fs.writeFileSync("release-notes.md", finalNotes, "utf8");
+          '
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --prerelease=false --latest --title "magpie ${VERSION}" --notes "$notes"
+            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --prerelease=false --latest --title "magpie ${VERSION}" --notes-file release-notes.md
             gh release upload "$TAG" release-assets/* -R "$GITHUB_REPOSITORY" --clobber
           else
             gh release create "$TAG" release-assets/* -R "$GITHUB_REPOSITORY" \
-              --latest --target "$GITHUB_SHA" --title "magpie ${VERSION}" --notes "$notes"
+              --latest --target "$GITHUB_SHA" --title "magpie ${VERSION}" --notes-file release-notes.md
           fi
