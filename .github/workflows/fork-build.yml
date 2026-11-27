@@ -345,10 +345,10 @@ jobs:
             }
 
             let finalNotes = "";
-            const idx = raw.indexOf(zhMarker);
-            if (idx >= 0) {
-              let enPart = raw.slice(0, idx).trim();
-              let zhPart = raw.slice(idx + zhMarker.length).trim();
+            const markerMatch = raw.match(/^[ \t]*<!-- lang:zh -->[ \t]*$/m);
+            if (markerMatch) {
+              let enPart = raw.slice(0, markerMatch.index).trim();
+              let zhPart = raw.slice(markerMatch.index + markerMatch[0].length).trim();
               if (!/^##\s+Install\b/im.test(enPart)) enPart = enPart ? `${enPart}\n\n${installEn}` : installEn;
               if (!/^##\s+安装\b/m.test(zhPart)) zhPart = zhPart ? `${zhPart}\n\n${installZh}` : installZh;
               finalNotes = `${enPart}\n\n${zhMarker}\n\n${zhPart}\n`;
