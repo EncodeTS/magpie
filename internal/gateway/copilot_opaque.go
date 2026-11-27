@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -61,6 +62,16 @@ func opaqueKey(user, model, id string) string {
 	return base64.RawURLEncoding.EncodeToString(h[:opaqueKeyBytes])
 }
 
+// copilotOpaqueScope maps Copilot Gemini models on the same account onto one
+// shared scope so sibling Gemini switches reuse reasoning_opaque, while
+// non-Gemini models stay scoped to their exact model name.
+func copilotOpaqueScope(model string) string {
+	if strings.Contains(strings.ToLower(strings.TrimSpace(model)), "gemini") {
+		return "gemini"
+	}
+	return model
+}
+
 // keepOpaque stores opaque for call id of user's model, written whole
 // (temp-and-rename) so a reader never sees half of one.
 func keepOpaque(user, model, id, opaque string) {
@@ -68,7 +79,7 @@ func keepOpaque(user, model, id, opaque string) {
 		return
 	}
 	dir := copilotOpaqueDir()
-	path := filepath.Join(dir, opaqueKey(user, model, id))
+	path := filepath.Join(dir, opaqueKey(user, copilotOpaqueScope(model), id))
 	if b, err := os.ReadFile(path); err == nil && string(b) == opaque {
 		return
 	}
@@ -94,7 +105,18 @@ func keptOpaque(user, model, id string) string {
 	if id == "" {
 		return ""
 	}
-	path := filepath.Join(copilotOpaqueDir(), opaqueKey(user, model, id))
+	scope := copilotOpaqueScope(model)
+	if got := readOpaqueKey(opaqueKey(user, scope, id)); got != "" {
+		return got
+	}
+	if scope != model {
+		return readOpaqueKey(opaqueKey(user, model, id))
+	}
+	return ""
+}
+
+func readOpaqueKey(key string) string {
+	path := filepath.Join(copilotOpaqueDir(), key)
 	b, err := os.ReadFile(path)
 	if err != nil || len(b) == 0 {
 		return ""

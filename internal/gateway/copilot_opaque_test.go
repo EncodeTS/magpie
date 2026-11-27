@@ -24,7 +24,7 @@ const opaqueSeal = "WY6FaAAlekE9Hryej63xF4ok8vf0wtpUKcezFmQKluSFdL7nRf91nGZAwjmG
 func copilotOpaqueUp(t *testing.T, sent *[]string) {
 	t.Helper()
 	var mu sync.Mutex
-	copilotAPIFake(t, map[string]string{"gemini-4-hydrogen": `["/chat/completions"]`, "gemini-4-carbon": `["/chat/completions"]`},
+	copilotAPIFake(t, map[string]string{"gemini-4-hydrogen": `["/chat/completions"]`, "gemini-4-carbon": `["/chat/completions"]`, "gpt-4.1": `["/chat/completions"]`},
 		func(w http.ResponseWriter, r *http.Request) {
 			b, _ := io.ReadAll(r.Body)
 			if r.URL.Path != "/chat/completions" {
@@ -149,7 +149,7 @@ func TestCopilotOpaqueOnlyItsOwn(t *testing.T) {
 	if got := opaqueOn(sent[len(sent)-1]); got != "the client's own" {
 		t.Errorf("the client's own opaque was replaced: %q", got)
 	}
-	postOpaque(t, s, "/v1/chat/completions", chatSecondTurn("copilot/gemini-4-carbon", "", true))
+	postOpaque(t, s, "/v1/chat/completions", chatSecondTurn("copilot/gpt-4.1", "", true))
 	if got := sent[len(sent)-1]; strings.Contains(got, "reasoning_opaque") {
 		t.Errorf("another model was sent this one's opaque:\n%s", got)
 	}
