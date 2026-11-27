@@ -465,6 +465,78 @@ func isCopilotEmptyInvalidBody(status int, errBody []byte) bool {
 	return unwrapWrappedEmptyInvalidBody(msg.String())
 }
 
+func isGenericInvalidBodyText(s string) bool {
+	s = strings.TrimSpace(s)
+	if strings.HasSuffix(s, ")") {
+		for _, marker := range []string{" (HTTP 400", " (invalid_request_error", " (invalid_body"} {
+			if i := strings.LastIndex(s, marker); i >= 0 {
+				s = strings.TrimSpace(s[:i])
+				break
+			}
+		}
+	}
+	s = strings.ToLower(strings.TrimSpace(strings.TrimSuffix(s, ".")))
+	switch s {
+	case "", "upstream rejected the request", "invalid body", "invalid request body", "bad request", "400 bad request", "request rejected":
+		return true
+	default:
+		return false
+	}
+}
+
+// isOpaqueInvalidBody matches a Responses provider's sanitized HTTP 400
+// rejection whose code is generic "invalid_body" with no param and an empty or
+// generic rejection message (raw or wrapped by writeKeptError /
+// writeVendorError), where foreign reasoning encrypted_content cannot be
+// identified from the error wording alone.
+func isOpaqueInvalidBody(status int, errBody []byte) bool {
+	if status != http.StatusBadRequest {
+		return false
+	}
+	b := bytes.TrimSpace(errBody)
+	if len(b) == 0 || !json.Valid(b) {
+		return false
+	}
+	root := gjson.ParseBytes(b)
+	if !root.IsObject() {
+		return false
+	}
+	obj := root
+	if e := root.Get("error"); e.IsObject() {
+		obj = e
+	} else if e.Exists() {
+		return false
+	}
+	code := obj.Get("code")
+	if code.Type != gjson.String || code.String() != "invalid_body" {
+		return false
+	}
+	if param := obj.Get("param"); param.Exists() && param.Type != gjson.Null {
+		if param.Type != gjson.String || strings.TrimSpace(param.String()) != "" {
+			return false
+		}
+	}
+	msg := obj.Get("message")
+	if msg.Exists() && msg.Type != gjson.String {
+		return false
+	}
+	text := strings.TrimSpace(msg.String())
+	if isGenericInvalidBodyText(text) {
+		return true
+	}
+	if i := strings.Index(text, ": "); i > 0 && !strings.ContainsAny(text[:i], "{}") {
+		return isGenericInvalidBodyText(text[i+2:])
+	}
+	return false
+}
+
+func isOpaqueReasoningRefusal(c candidate, status int, errBody []byte) bool {
+	if accountAgent(c.p) == "copilot" {
+		return isCopilotEmptyInvalidBody(status, errBody)
+	}
+	return isOpaqueInvalidBody(status, errBody)
+}
+
 // withoutObservedForeignReasoning removes ONLY type == "reasoning" input items
 // whose encrypted_content has a known observed issuer distinct from targetIssuer.
 // Target-owned seals, unknown seals, compactions, messages, tool items, images,

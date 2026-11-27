@@ -4441,14 +4441,12 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			if b, ok := withoutRefused(stuck, c.vendor(), attemptBody); ok {
 				attemptBody = b
 			}
-			if accountAgent(c.p) == "copilot" {
-				scope := copilotHandoffScope(c)
-				if b, ok := withoutRefused(stuck, scope, attemptBody); ok {
-					attemptBody = b
-				}
-				if hb, ok := copilotHandoffBody[scope]; ok {
-					attemptBody = hb
-				}
+			scope := copilotHandoffScope(c)
+			if b, ok := withoutRefused(stuck, scope, attemptBody); ok {
+				attemptBody = b
+			}
+			if hb, ok := copilotHandoffBody[scope]; ok {
+				attemptBody = hb
 			}
 		}
 		if isGroup {
@@ -5249,9 +5247,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				continue
 			}
 		}
-		if !hw.passing && from == provider.Responses && accountAgent(c.p) == "copilot" {
+		if !hw.passing && from == provider.Responses {
 			scope := copilotHandoffScope(c)
-			if copilotHandoffStage[scope] < 2 && isCopilotEmptyInvalidBody(hw.code(), hw.errBody()) {
+			if copilotHandoffStage[scope] < 2 && isOpaqueReasoningRefusal(c, hw.code(), hw.errBody()) {
 				if b, dropped, nextStage, ok := nextCopilotHandoffBody(attemptBody, providerIssuer(c.p, c.model), copilotHandoffStage[scope]); ok {
 					copilotHandoffStage[scope] = nextStage
 					copilotHandoffBody[scope] = b
@@ -6226,7 +6224,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 				}
 			}
 		} else if call.Status < 400 {
-			if from == provider.Responses && accountAgent(c.p) == "copilot" {
+			if from == provider.Responses {
 				scope := copilotHandoffScope(c)
 				if dropped := copilotHandoffPending[scope]; len(dropped) > 0 {
 					noteRefused(stuck, scope, dropped)

@@ -789,3 +789,173 @@ func TestForkCopilotHandoffOwnOnlyAndUnrelated400NoFalseLearn(t *testing.T) {
 		t.Fatalf("unknown seal must not be falsely learned into refusedSeals (calls=%d): %s", len(callsC), string(callsC[0]))
 	}
 }
+
+func TestForkIsOpaqueInvalidBody(t *testing.T) {
+	wantMatch := []string{
+		`{"error":{"type":"invalid_request_error","code":"invalid_body","message":"Upstream rejected the request."}}`,
+		`{"error":{"type":"invalid_request_error","code":"invalid_body","message":"Relay One: Upstream rejected the request."}}`,
+		`{"error":{"type":"invalid_request_error","code":"invalid_body","message":"Relay One: Upstream rejected the request. (HTTP 400, invalid_body, request id req-123)"}}`,
+		`{"error":{"type":"invalid_request_error","code":"invalid_body","message":"Relay One: 400 Bad Request (invalid_request_error, invalid_body)"}}`,
+		`{"error":{"code":"invalid_body","message":""}}`,
+		`{"error":{"code":"invalid_body","param":null,"message":"Invalid request body."}}`,
+		`{"code":"invalid_body","message":"Upstream rejected the request."}`,
+	}
+	for _, raw := range wantMatch {
+		if !isOpaqueInvalidBody(400, []byte(raw)) {
+			t.Errorf("expected match for %s", raw)
+		}
+	}
+
+	wantNoMatch := []struct {
+		status int
+		body   string
+	}{
+		{400, `{"error":{"type":"invalid_request_error","code":"invalid_body","param":"tools[0]","message":"Upstream rejected the request."}}`},
+		{400, `{"error":{"type":"invalid_request_error","code":"invalid_body","message":"Relay One: Invalid value for reasoning.effort"}}`},
+		{400, `{"error":{"type":"invalid_request_error","code":"invalid_body","message":"Relay One: Required content safety checks are currently unavailable."}}`},
+		{400, `{"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Upstream rejected the request."}}`},
+		{400, `{"error":{"type":"invalid_request_error","code":"invalid_request_body","message":""}}`},
+		{422, `{"error":{"type":"invalid_request_error","code":"invalid_body","message":"Upstream rejected the request."}}`},
+		{500, `{"error":{"type":"invalid_request_error","code":"invalid_body","message":"Upstream rejected the request."}}`},
+		{400, `not json`},
+	}
+	for _, tc := range wantNoMatch {
+		if isOpaqueInvalidBody(tc.status, []byte(tc.body)) {
+			t.Errorf("expected no match for (%d, %s)", tc.status, tc.body)
+		}
+	}
+}
+
+func TestForkOpaqueInvalidBodyResponsesHandoff(t *testing.T) {
+	cop := &forkMockCopilot{}
+	setupForkCopilotAndCodex(t, cop, "gAAAA-codex-unused")
+
+	var mu sync.Mutex
+	var relayCalls [][]byte
+	ownSeals := map[string]bool{}
+	alwaysReject := false
+	respIdx := 0
+
+	relaySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		relayCalls = append(relayCalls, b)
+		rejectAll := alwaysReject
+		mu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		if rejectAll {
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, `{"error":{"type":"invalid_request_error","code":"invalid_body","message":"Upstream rejected the request."}}`)
+			return
+		}
+		var q struct {
+			Input []sealedItem `json:"input"`
+		}
+		_ = json.Unmarshal(b, &q)
+		mu.Lock()
+		for _, it := range q.Input {
+			if it.Type == "reasoning" && it.Enc != "" && !ownSeals[it.Enc] {
+				mu.Unlock()
+				w.WriteHeader(http.StatusBadRequest)
+				io.WriteString(w, `{"error":{"type":"invalid_request_error","code":"invalid_body","message":"Upstream rejected the request."}}`)
+				return
+			}
+		}
+		respIdx++
+		newSeal := fmt.Sprintf("gAAAA-relay-own-%d", respIdx)
+		ownSeals[newSeal] = true
+		mu.Unlock()
+
+		reasonItem := `{"type":"reasoning","id":"rs_rel_1","status":"completed","summary":[],"encrypted_content":"` + newSeal + `"}`
+		doneMsg := `{"type":"message","id":"msg_rel_1","role":"assistant","content":[{"type":"output_text","text":"RELAY_DONE"}]}`
+		io.WriteString(w, `{"id":"resp_r1","object":"response","status":"completed","output":[`+reasonItem+`,`+doneMsg+`],"usage":{"input_tokens":5,"output_tokens":2}}`)
+	}))
+	t.Cleanup(relaySrv.Close)
+
+	if err := provider.Save(provider.Provider{
+		ID:        "relay1",
+		Name:      "Relay One",
+		Key:       "k-relay1",
+		Models:    []string{"gpt-a", "gpt-b"},
+		Responses: relaySrv.URL + "/v1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New()
+
+	// Turn 1: relay1/gpt-a issues its own Fernet-shaped seal (observed under relay1 issuer).
+	if code, out := gatewayPost(t, s, "/v1/responses", `{"model":"relay1/gpt-a","stream":false,"store":false,"prompt_cache_key":"thread-relay-mix","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"t1"}]}]}`); code != 200 || !strings.Contains(out, "RELAY_DONE") {
+		t.Fatalf("relay turn 1 failed: %d %s", code, out)
+	}
+	relayOwnSeal := "gAAAA-relay-own-1"
+
+	// Turn 2: copilot/gpt-6.2-sol issues a foreign seal (observed under copilot issuer).
+	if code, out := gatewayPost(t, s, "/v1/responses", `{"model":"copilot/gpt-6.2-sol","stream":false,"store":false,"prompt_cache_key":"thread-relay-mix","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"t2"}]}]}`); code != 200 || !strings.Contains(out, "COPILOT_DONE") {
+		t.Fatalf("copilot turn 2 failed: %d %s", code, out)
+	}
+	copilotSeal := "gAAAA-copilot-seal-1"
+
+	// Turn 3: relay1/gpt-b receives an unobserved foreign Fernet seal + known Copilot seal + relay's own seal.
+	// Stage 1 must strip copilotSeal while keeping relayOwnSeal; stage 2 must strip unknownForeign while still keeping relayOwnSeal.
+	unknownForeign := "gAAAA-other-machine-seal"
+	turn3 := `{"model":"relay1/gpt-b","stream":false,"store":false,"prompt_cache_key":"thread-relay-mix","input":[` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"t0"}]},` +
+		`{"type":"reasoning","id":"rs_unk","summary":[],"encrypted_content":"` + unknownForeign + `"},` +
+		`{"type":"reasoning","id":"rs_cop","summary":[],"encrypted_content":"` + copilotSeal + `"},` +
+		`{"type":"reasoning","id":"rs_own","summary":[],"encrypted_content":"` + relayOwnSeal + `"},` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"t3"}]}` +
+		`]}`
+	mu.Lock()
+	before3 := len(relayCalls)
+	mu.Unlock()
+	if code, out := gatewayPost(t, s, "/v1/responses", turn3); code != 200 || !strings.Contains(out, "RELAY_DONE") {
+		t.Fatalf("relay two-stage recovery failed: %d %s", code, out)
+	}
+	mu.Lock()
+	calls3 := append([][]byte(nil), relayCalls[before3:]...)
+	mu.Unlock()
+	if len(calls3) != 3 {
+		t.Fatalf("expected 3 calls (raw -> stage 1 -> stage 2), got %d", len(calls3))
+	}
+	if strings.Contains(string(calls3[1]), copilotSeal) || !strings.Contains(string(calls3[1]), unknownForeign) || !strings.Contains(string(calls3[1]), relayOwnSeal) {
+		t.Fatalf("unexpected stage-1 body: %s", calls3[1])
+	}
+	if strings.Contains(string(calls3[2]), copilotSeal) || strings.Contains(string(calls3[2]), unknownForeign) || !strings.Contains(string(calls3[2]), relayOwnSeal) {
+		t.Fatalf("unexpected stage-2 body: %s", calls3[2])
+	}
+
+	// Turn 4: both refused seals must be stripped proactively on attempt 0 (1 upstream call), keeping relayOwnSeal intact.
+	mu.Lock()
+	before4 := len(relayCalls)
+	mu.Unlock()
+	if code, out := gatewayPost(t, s, "/v1/responses", turn3); code != 200 || !strings.Contains(out, "RELAY_DONE") {
+		t.Fatalf("relay turn 4 failed: %d %s", code, out)
+	}
+	mu.Lock()
+	calls4 := append([][]byte(nil), relayCalls[before4:]...)
+	mu.Unlock()
+	if len(calls4) != 1 || strings.Contains(string(calls4[0]), copilotSeal) || strings.Contains(string(calls4[0]), unknownForeign) || !strings.Contains(string(calls4[0]), relayOwnSeal) {
+		t.Fatalf("expected proactive strip on turn 4 (calls=%d): %s", len(calls4), string(calls4[0]))
+	}
+
+	// Persistent unrelated invalid_body with only known own seal: 0 retries.
+	mu.Lock()
+	alwaysReject = true
+	before5 := len(relayCalls)
+	mu.Unlock()
+	ownOnly := `{"model":"relay1/gpt-b","stream":false,"store":false,"prompt_cache_key":"thread-relay-mix","input":[` +
+		`{"type":"reasoning","id":"rs_own","summary":[],"encrypted_content":"` + relayOwnSeal + `"},` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"t5"}]}` +
+		`]}`
+	if code, _ := gatewayPost(t, s, "/v1/responses", ownOnly); code != 400 {
+		t.Fatalf("expected 400 for unrelated own-only rejection, got %d", code)
+	}
+	mu.Lock()
+	calls5 := append([][]byte(nil), relayCalls[before5:]...)
+	mu.Unlock()
+	if len(calls5) != 1 {
+		t.Fatalf("expected 0 retries when only known own seal is present, got %d calls", len(calls5))
+	}
+}
