@@ -4085,7 +4085,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		}
 	}()
 	nearBehind := map[string]bool{} // accounts near their cap moved behind the rest once
-	copilotHandoffTried := map[string]bool{}
+	copilotHandoffStage := map[string]int{}
 	copilotHandoffBody := map[string][]byte{}
 	copilotHandoffPending := map[string][][sha256.Size]byte{}
 	var nearInKey time.Duration // the key's slot waited for before an account's turn near its cap
@@ -5251,11 +5251,11 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		}
 		if !hw.passing && from == provider.Responses && accountAgent(c.p) == "copilot" {
 			scope := copilotHandoffScope(c)
-			if !copilotHandoffTried[scope] && isCopilotEmptyInvalidBody(hw.code(), hw.errBody()) {
-				if b, dropped, ok := withoutObservedForeignReasoning(attemptBody, providerIssuer(c.p, c.model)); ok {
-					copilotHandoffTried[scope] = true
+			if copilotHandoffStage[scope] < 2 && isCopilotEmptyInvalidBody(hw.code(), hw.errBody()) {
+				if b, dropped, nextStage, ok := nextCopilotHandoffBody(attemptBody, providerIssuer(c.p, c.model), copilotHandoffStage[scope]); ok {
+					copilotHandoffStage[scope] = nextStage
 					copilotHandoffBody[scope] = b
-					copilotHandoffPending[scope] = dropped
+					copilotHandoffPending[scope] = append(copilotHandoffPending[scope], dropped...)
 					try.Fail = failForeign
 					s.trace.update(tr, func(t *Route) { t.Tries[len(t.Tries)-1] = try })
 					i--

@@ -3,8 +3,12 @@ package gateway
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -13,12 +17,15 @@ import (
 
 	"github.com/yetone/magpie/internal/claudeseal"
 	"github.com/yetone/magpie/internal/provider"
+	"github.com/yetone/magpie/internal/settings"
+	"github.com/yetone/magpie/internal/steady"
 )
 
 const (
-	sealIssuerLimit = 4096
-	sealIssuerTTL   = 12 * time.Hour
-	sealObserverCap = 8 << 20
+	sealIssuerLimit      = 4096
+	sealIssuerTTL        = 14 * 24 * time.Hour
+	sealIssuerRefreshGap = time.Hour
+	sealObserverCap      = 8 << 20
 )
 
 type sealIssuerEntry struct {
@@ -26,10 +33,150 @@ type sealIssuerEntry struct {
 	at     time.Time
 }
 
+type sealIssuersDiskEntry struct {
+	Issuer string `json:"i"`
+	AtUnix int64  `json:"t"`
+}
+
+type sealIssuersDisk struct {
+	Version int                             `json:"v"`
+	Entries map[string]sealIssuersDiskEntry `json:"entries"`
+}
+
+var sealIssuersPath = func() string {
+	return filepath.Join(settings.Dir(), "fork-seal-issuers.json")
+}
+
+// Lock ordering: always acquire ioMu before mu, never mu before ioMu.
 var sealIssuers = struct {
-	mu sync.Mutex
-	m  map[[sha256.Size]byte]sealIssuerEntry
+	mu         sync.Mutex
+	ioMu       sync.Mutex
+	loadedPath string
+	gen        uint64
+	savedGen   uint64
+	m          map[[sha256.Size]byte]sealIssuerEntry
 }{m: map[[sha256.Size]byte]sealIssuerEntry{}}
+
+func loadSealIssuersFile(path string, now time.Time) map[[sha256.Size]byte]sealIssuerEntry {
+	m := map[[sha256.Size]byte]sealIssuerEntry{}
+	if path == "" {
+		return m
+	}
+	raw, err := steady.ReadFile(path)
+	if err != nil || len(raw) == 0 {
+		return m
+	}
+	var disk sealIssuersDisk
+	if json.Unmarshal(raw, &disk) != nil || len(disk.Entries) == 0 {
+		return m
+	}
+	type loadedItem struct {
+		key [sha256.Size]byte
+		ent sealIssuerEntry
+	}
+	items := make([]loadedItem, 0, len(disk.Entries))
+	for hexKey, rec := range disk.Entries {
+		if rec.Issuer == "" || rec.AtUnix <= 0 {
+			continue
+		}
+		at := time.Unix(rec.AtUnix, 0)
+		if now.Sub(at) > sealIssuerTTL {
+			continue
+		}
+		b, err := hex.DecodeString(hexKey)
+		if err != nil || len(b) != sha256.Size {
+			continue
+		}
+		var key [sha256.Size]byte
+		copy(key[:], b)
+		items = append(items, loadedItem{key: key, ent: sealIssuerEntry{issuer: rec.Issuer, at: at}})
+	}
+	if len(items) > sealIssuerLimit {
+		slices.SortFunc(items, func(a, b loadedItem) int {
+			return b.ent.at.Compare(a.ent.at)
+		})
+		items = items[:sealIssuerLimit]
+	}
+	for _, it := range items {
+		m[it.key] = it.ent
+	}
+	return m
+}
+
+func ensureSealIssuersLoaded(now time.Time) string {
+	path := sealIssuersPath()
+	sealIssuers.mu.Lock()
+	if sealIssuers.loadedPath == path && sealIssuers.m != nil {
+		sealIssuers.mu.Unlock()
+		return path
+	}
+	sealIssuers.mu.Unlock()
+
+	sealIssuers.ioMu.Lock()
+	defer sealIssuers.ioMu.Unlock()
+
+	sealIssuers.mu.Lock()
+	if sealIssuers.loadedPath == path && sealIssuers.m != nil {
+		sealIssuers.mu.Unlock()
+		return path
+	}
+	sealIssuers.mu.Unlock()
+
+	loaded := loadSealIssuersFile(path, now)
+
+	sealIssuers.mu.Lock()
+	if sealIssuers.loadedPath != path || sealIssuers.m == nil {
+		sealIssuers.m = loaded
+		sealIssuers.loadedPath = path
+		sealIssuers.gen = 0
+		sealIssuers.savedGen = 0
+	}
+	sealIssuers.mu.Unlock()
+	return path
+}
+
+func persistSealIssuers(path string, want uint64, now time.Time) {
+	if path == "" {
+		return
+	}
+	sealIssuers.ioMu.Lock()
+	defer sealIssuers.ioMu.Unlock()
+
+	sealIssuers.mu.Lock()
+	if sealIssuers.loadedPath != path || sealIssuers.savedGen >= want {
+		sealIssuers.mu.Unlock()
+		return
+	}
+	snapGen := sealIssuers.gen
+	entries := make(map[string]sealIssuersDiskEntry, len(sealIssuers.m))
+	for k, v := range sealIssuers.m {
+		if now.Sub(v.at) > sealIssuerTTL {
+			delete(sealIssuers.m, k)
+			continue
+		}
+		entries[hex.EncodeToString(k[:])] = sealIssuersDiskEntry{
+			Issuer: v.issuer,
+			AtUnix: v.at.Unix(),
+		}
+	}
+	sealIssuers.mu.Unlock()
+
+	data, err := json.Marshal(sealIssuersDisk{Version: 1, Entries: entries})
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return
+	}
+	if err := steady.WriteFile(path, data, 0o600); err != nil {
+		return
+	}
+	sealIssuers.mu.Lock()
+	if sealIssuers.loadedPath == path && snapGen > sealIssuers.savedGen {
+		sealIssuers.savedGen = snapGen
+	}
+	sealIssuers.mu.Unlock()
+}
 
 func recordSealIssuer(enc, issuer string) {
 	if enc == "" || issuer == "" || claudeseal.Is(enc) {
@@ -37,10 +184,15 @@ func recordSealIssuer(enc, issuer string) {
 	}
 	sum := sha256.Sum256([]byte(enc))
 	now := time.Now()
+	path := ensureSealIssuersLoaded(now)
+
 	sealIssuers.mu.Lock()
-	defer sealIssuers.mu.Unlock()
 	if sealIssuers.m == nil {
 		sealIssuers.m = map[[sha256.Size]byte]sealIssuerEntry{}
+	}
+	if prev, ok := sealIssuers.m[sum]; ok && prev.issuer == issuer && now.Sub(prev.at) < sealIssuerRefreshGap {
+		sealIssuers.mu.Unlock()
+		return
 	}
 	if _, ok := sealIssuers.m[sum]; !ok && len(sealIssuers.m) >= sealIssuerLimit {
 		var oldestKey [sha256.Size]byte
@@ -59,6 +211,10 @@ func recordSealIssuer(enc, issuer string) {
 		}
 	}
 	sealIssuers.m[sum] = sealIssuerEntry{issuer: issuer, at: now}
+	sealIssuers.gen++
+	want := sealIssuers.gen
+	sealIssuers.mu.Unlock()
+	persistSealIssuers(path, want, now)
 }
 
 func sealIssuerOf(enc string) (string, bool) {
@@ -67,6 +223,7 @@ func sealIssuerOf(enc string) (string, bool) {
 	}
 	sum := sha256.Sum256([]byte(enc))
 	now := time.Now()
+	ensureSealIssuersLoaded(now)
 	sealIssuers.mu.Lock()
 	defer sealIssuers.mu.Unlock()
 	e, ok := sealIssuers.m[sum]
@@ -313,6 +470,18 @@ func isCopilotEmptyInvalidBody(status int, errBody []byte) bool {
 // Target-owned seals, unknown seals, compactions, messages, tool items, images,
 // include, and prompt_cache_key stay byte-for-byte untouched.
 func withoutObservedForeignReasoning(body []byte, targetIssuer string) ([]byte, [][sha256.Size]byte, bool) {
+	return stripCopilotReasoningSeals(body, targetIssuer, false)
+}
+
+// withoutUnverifiedForeignReasoning is the stateless fallback after Copilot
+// still rejects a request with empty invalid_request_body: it strips reasoning
+// items whose encrypted_content is not known to belong to targetIssuer, while
+// keeping target-owned seals, compactions, messages, tool items, and images.
+func withoutUnverifiedForeignReasoning(body []byte, targetIssuer string) ([]byte, [][sha256.Size]byte, bool) {
+	return stripCopilotReasoningSeals(body, targetIssuer, true)
+}
+
+func stripCopilotReasoningSeals(body []byte, targetIssuer string, dropUnknown bool) ([]byte, [][sha256.Size]byte, bool) {
 	if targetIssuer == "" {
 		return nil, nil, false
 	}
@@ -329,7 +498,8 @@ func withoutObservedForeignReasoning(body []byte, targetIssuer string) ([]byte, 
 	for _, it := range items {
 		var t sealedItem
 		if decodeJSONView(it, &t) == nil && t.Type == "reasoning" && t.Enc != "" {
-			if issuer, known := sealIssuerOf(t.Enc); known && issuer != targetIssuer {
+			issuer, known := sealIssuerOf(t.Enc)
+			if (known && issuer != targetIssuer) || (dropUnknown && !known) {
 				dropped = append(dropped, sha256.Sum256([]byte(t.Enc)))
 				continue
 			}
@@ -345,4 +515,22 @@ func withoutObservedForeignReasoning(body []byte, targetIssuer string) ([]byte, 
 		return nil, nil, false
 	}
 	return out, dropped, true
+}
+
+// nextCopilotHandoffBody advances Copilot's #7410 recovery in at most two
+// stages: stage 0->1 strips only observed foreign seals; stage 1->2 (or 0->2
+// when no observed foreign seal exists) falls back to stripping unobserved
+// reasoning seals while keeping known target-owned seals intact.
+func nextCopilotHandoffBody(body []byte, targetIssuer string, stage int) ([]byte, [][sha256.Size]byte, int, bool) {
+	if stage < 1 {
+		if b, dropped, ok := withoutObservedForeignReasoning(body, targetIssuer); ok {
+			return b, dropped, 1, true
+		}
+	}
+	if stage < 2 {
+		if b, dropped, ok := withoutUnverifiedForeignReasoning(body, targetIssuer); ok {
+			return b, dropped, 2, true
+		}
+	}
+	return nil, nil, stage, false
 }

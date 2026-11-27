@@ -20,9 +20,31 @@ import (
 )
 
 func resetSealIssuersForTest() {
+	sealIssuers.ioMu.Lock()
 	sealIssuers.mu.Lock()
 	sealIssuers.m = map[[sha256.Size]byte]sealIssuerEntry{}
+	sealIssuers.loadedPath = ""
+	sealIssuers.gen = 0
+	sealIssuers.savedGen = 0
 	sealIssuers.mu.Unlock()
+	if path := sealIssuersPath(); path != "" {
+		_ = os.Remove(path)
+	}
+	sealIssuers.ioMu.Unlock()
+}
+
+func clearSealIssuersMemoryForRestart() {
+	sealIssuers.ioMu.Lock()
+	sealIssuers.mu.Lock()
+	sealIssuers.m = map[[sha256.Size]byte]sealIssuerEntry{}
+	sealIssuers.loadedPath = ""
+	sealIssuers.gen = 0
+	sealIssuers.savedGen = 0
+	sealIssuers.mu.Unlock()
+	sealIssuers.ioMu.Unlock()
+	refusedSeals.Lock()
+	refusedSeals.m = map[string]sealsRefused{}
+	refusedSeals.Unlock()
 }
 
 func TestForkClaudeSealShellDropped(t *testing.T) {
@@ -167,12 +189,13 @@ func TestForkWithoutObservedForeignReasoning(t *testing.T) {
 }
 
 type forkMockCopilot struct {
-	mu          sync.Mutex
-	calls       [][]byte
-	paths       []string
-	ownSeals    map[string]bool
-	failAfter   bool
-	responseIdx int
+	mu             sync.Mutex
+	calls          [][]byte
+	paths          []string
+	ownSeals       map[string]bool
+	failAfter      bool
+	alwaysEmpty400 bool
+	responseIdx    int
 }
 
 func (m *forkMockCopilot) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -180,11 +203,18 @@ func (m *forkMockCopilot) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	m.calls = append(m.calls, b)
 	m.paths = append(m.paths, r.URL.Path)
+	alwaysEmpty400 := m.alwaysEmpty400
 	m.mu.Unlock()
 
 	if r.URL.Path == "/chat/completions" {
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"id":"chat_1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"CARBON_OK"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}`)
+		return
+	}
+	if alwaysEmpty400 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"error":{"message":"","code":"invalid_request_body"}}`)
 		return
 	}
 
@@ -510,4 +540,252 @@ func TestForkRefusedSealsAndIssuerConcurrency(t *testing.T) {
 		}(g)
 	}
 	wg.Wait()
+}
+
+func TestForkSealIssuersPersistAcrossRestart(t *testing.T) {
+	cop := &forkMockCopilot{}
+	codexSeal := "gAAAA-codex-before-restart"
+	setupForkCopilotAndCodex(t, cop, codexSeal)
+	s := New()
+
+	// Turn 1: Codex produces codexSeal; Turn 2: Copilot produces its own seal.
+	if code, _ := codexBackendPost(t, s, `{"model":"gpt-5.4","stream":true,"prompt_cache_key":"thread-restart","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"t1"}]}]}`); code != 200 {
+		t.Fatal("codex turn 1 failed")
+	}
+	turn2 := `{"model":"copilot/gpt-6.2-sol","stream":false,"store":false,"prompt_cache_key":"thread-restart","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"t2"}]}]}`
+	if code, out := gatewayPost(t, s, "/v1/responses", turn2); code != 200 || !strings.Contains(out, "COPILOT_DONE") {
+		t.Fatalf("copilot turn 2 failed: %d %s", code, out)
+	}
+	copilotSeal := "gAAAA-copilot-seal-1"
+
+	// Disk file must hold only SHA-256 digests, never plaintext seals.
+	diskPath := sealIssuersPath()
+	raw, err := os.ReadFile(diskPath)
+	if err != nil {
+		t.Fatalf("expected persisted seal issuers file at %s: %v", diskPath, err)
+	}
+	if strings.Contains(string(raw), codexSeal) || strings.Contains(string(raw), copilotSeal) {
+		t.Fatalf("plaintext seal leaked into persisted file: %s", raw)
+	}
+
+	// Simulate full process restart: clear in-memory sealIssuers & refusedSeals, construct new Server.
+	clearSealIssuersMemoryForRestart()
+	s2 := New()
+
+	// Turn 3 after restart carries both codexSeal and copilotSeal plus an unobserved unknown seal.
+	// Persisted sealIssuers lets stage 1 strip ONLY codexSeal, keeping copilotSeal & unknownSeal intact.
+	unknownSeal := "gAAAA-unrelated-unobserved-ok"
+	turn3 := `{"model":"copilot/gpt-6.2-sol","stream":false,"store":false,"prompt_cache_key":"thread-restart","input":[` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"t1"}]},` +
+		`{"type":"reasoning","id":"rs_codex_1","summary":[],"encrypted_content":"` + codexSeal + `"},` +
+		`{"type":"reasoning","id":"rs_cop_1","summary":[],"encrypted_content":"` + copilotSeal + `"},` +
+		`{"type":"reasoning","id":"rs_unk_1","summary":[],"encrypted_content":"` + unknownSeal + `"},` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"t3"}]}` +
+		`]}`
+	before := len(cop.asked())
+	code, out := gatewayPost(t, s2, "/v1/responses", turn3)
+	if code != 200 || !strings.Contains(out, "COPILOT_DONE") {
+		t.Fatalf("post-restart handoff failed: %d %s", code, out)
+	}
+	calls := cop.asked()[before:]
+	if len(calls) != 2 {
+		t.Fatalf("expected attempt 0 + stage-1 retry (2 calls), got %d", len(calls))
+	}
+	retryBody := string(calls[1])
+	if strings.Contains(retryBody, codexSeal) {
+		t.Fatalf("stage-1 retry should strip persisted codexSeal: %s", retryBody)
+	}
+	if !strings.Contains(retryBody, copilotSeal) || !strings.Contains(retryBody, unknownSeal) {
+		t.Fatalf("stage-1 retry should preserve copilotSeal and unknownSeal: %s", retryBody)
+	}
+
+	// Corrupt disk file and expired entries degrade gracefully without breaking writes.
+	if err := os.WriteFile(diskPath, []byte("{corrupt-json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clearSealIssuersMemoryForRestart()
+	if _, known := sealIssuerOf(codexSeal); known {
+		t.Fatal("expected corrupt file to load as empty")
+	}
+	recordSealIssuer("gAAAA-fresh-after-corrupt", "codex-relay|chatgpt.com")
+	clearSealIssuersMemoryForRestart()
+	if got, known := sealIssuerOf("gAAAA-fresh-after-corrupt"); !known || got != "codex-relay|chatgpt.com" {
+		t.Fatalf("expected recovery after corrupt file, got (%q, %v)", got, known)
+	}
+
+	// Expired entries (>14d) are pruned on load.
+	expiredHex := fmt.Sprintf("%x", sha256.Sum256([]byte("gAAAA-expired-seal")))
+	validHex := fmt.Sprintf("%x", sha256.Sum256([]byte("gAAAA-valid-seal")))
+	expiredJSON, _ := json.Marshal(sealIssuersDisk{
+		Version: 1,
+		Entries: map[string]sealIssuersDiskEntry{
+			expiredHex: {Issuer: "codex-relay|chatgpt.com", AtUnix: time.Now().Add(-15 * 24 * time.Hour).Unix()},
+			validHex:   {Issuer: "codex-relay|chatgpt.com", AtUnix: time.Now().Add(-2 * 24 * time.Hour).Unix()},
+		},
+	})
+	if err := os.WriteFile(diskPath, expiredJSON, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	clearSealIssuersMemoryForRestart()
+	if _, known := sealIssuerOf("gAAAA-expired-seal"); known {
+		t.Fatal("expected 15-day-old seal to be pruned on load")
+	}
+	if got, known := sealIssuerOf("gAAAA-valid-seal"); !known || got != "codex-relay|chatgpt.com" {
+		t.Fatalf("expected 2-day-old seal to reload, got (%q, %v)", got, known)
+	}
+}
+
+func TestForkCopilotHandoffUnknownFallbackPreservesOwnSeal(t *testing.T) {
+	cop := &forkMockCopilot{}
+	setupForkCopilotAndCodex(t, cop, "gAAAA-codex-unused")
+	s := New()
+
+	// Turn 1: Copilot issues its own seal (observed & persisted).
+	if code, out := gatewayPost(t, s, "/v1/responses", `{"model":"copilot/gpt-6.2-sol","stream":false,"store":false,"prompt_cache_key":"thread-unknown-fb","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"t1"}]}]}`); code != 200 || !strings.Contains(out, "COPILOT_DONE") {
+		t.Fatalf("copilot turn 1 failed: %d %s", code, out)
+	}
+	copilotSeal := "gAAAA-copilot-seal-1"
+	// Unobserved foreign seal (e.g. from another computer / >14 days old, never recorded in sealIssuers).
+	unobservedForeign := "gAAAA-codex-from-other-machine"
+
+	turn2 := `{"model":"copilot/gpt-6.2-sol","stream":false,"store":false,"prompt_cache_key":"thread-unknown-fb","input":[` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"t0"}]},` +
+		`{"type":"reasoning","id":"rs_old_foreign","summary":[],"encrypted_content":"` + unobservedForeign + `"},` +
+		`{"type":"compaction","id":"cmp_keep","encrypted_content":"gAAAA-compaction-keep"},` +
+		`{"type":"reasoning","id":"rs_cop_own","summary":[],"encrypted_content":"` + copilotSeal + `"},` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"t2"}]}` +
+		`]}`
+	before := len(cop.asked())
+	code, out := gatewayPost(t, s, "/v1/responses", turn2)
+	if code != 200 || !strings.Contains(out, "COPILOT_DONE") {
+		t.Fatalf("unknown fallback failed: %d %s", code, out)
+	}
+	calls := cop.asked()[before:]
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 calls (attempt 0 + stage-2 fallback directly), got %d", len(calls))
+	}
+	retryBody := string(calls[1])
+	if strings.Contains(retryBody, unobservedForeign) {
+		t.Fatalf("stage-2 fallback should strip unobserved foreign seal: %s", retryBody)
+	}
+	if !strings.Contains(retryBody, copilotSeal) || !strings.Contains(retryBody, "cmp_keep") {
+		t.Fatalf("stage-2 fallback must keep known own seal and compaction: %s", retryBody)
+	}
+
+	// Turn 3: refusedSeals learned unobservedForeign, so turn 3 succeeds on attempt 0 (1 call).
+	before3 := len(cop.asked())
+	if code, out := gatewayPost(t, s, "/v1/responses", turn2); code != 200 || !strings.Contains(out, "COPILOT_DONE") {
+		t.Fatalf("turn 3 failed: %d %s", code, out)
+	}
+	calls3 := cop.asked()[before3:]
+	if len(calls3) != 1 || strings.Contains(string(calls3[0]), unobservedForeign) || !strings.Contains(string(calls3[0]), copilotSeal) {
+		t.Fatalf("expected proactive strip on turn 3 (calls=%d): %s", len(calls3), string(calls3[0]))
+	}
+}
+
+func TestForkCopilotHandoffTwoStageKnownThenUnknown(t *testing.T) {
+	cop := &forkMockCopilot{}
+	knownForeign := "gAAAA-codex-known"
+	setupForkCopilotAndCodex(t, cop, knownForeign)
+	s := New()
+
+	// Observe knownForeign from Codex and copilotSeal from Copilot.
+	if code, _ := codexBackendPost(t, s, `{"model":"gpt-5.4","stream":true,"prompt_cache_key":"thread-2stage","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"t1"}]}]}`); code != 200 {
+		t.Fatal("codex turn 1 failed")
+	}
+	if code, out := gatewayPost(t, s, "/v1/responses", `{"model":"copilot/gpt-6.2-sol","stream":false,"store":false,"prompt_cache_key":"thread-2stage","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"t2"}]}]}`); code != 200 || !strings.Contains(out, "COPILOT_DONE") {
+		t.Fatalf("copilot turn 2 failed: %d %s", code, out)
+	}
+	copilotSeal := "gAAAA-copilot-seal-1"
+	unknownForeign := "gAAAA-codex-unobserved-older"
+
+	turn3 := `{"model":"copilot/gpt-6.2-sol","stream":false,"store":false,"prompt_cache_key":"thread-2stage","input":[` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"t0"}]},` +
+		`{"type":"reasoning","id":"rs_unk","summary":[],"encrypted_content":"` + unknownForeign + `"},` +
+		`{"type":"reasoning","id":"rs_known","summary":[],"encrypted_content":"` + knownForeign + `"},` +
+		`{"type":"reasoning","id":"rs_own","summary":[],"encrypted_content":"` + copilotSeal + `"},` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"t3"}]}` +
+		`]}`
+	before := len(cop.asked())
+	code, out := gatewayPost(t, s, "/v1/responses", turn3)
+	if code != 200 || !strings.Contains(out, "COPILOT_DONE") {
+		t.Fatalf("two-stage recovery failed: %d %s", code, out)
+	}
+	calls := cop.asked()[before:]
+	if len(calls) != 3 {
+		t.Fatalf("expected 3 calls (raw -> stage 1 -> stage 2), got %d", len(calls))
+	}
+	// Stage 1 stripped knownForeign, kept unknownForeign + copilotSeal.
+	if strings.Contains(string(calls[1]), knownForeign) || !strings.Contains(string(calls[1]), unknownForeign) || !strings.Contains(string(calls[1]), copilotSeal) {
+		t.Fatalf("unexpected stage-1 body: %s", calls[1])
+	}
+	// Stage 2 stripped unknownForeign too, still kept copilotSeal.
+	if strings.Contains(string(calls[2]), knownForeign) || strings.Contains(string(calls[2]), unknownForeign) || !strings.Contains(string(calls[2]), copilotSeal) {
+		t.Fatalf("unexpected stage-2 body: %s", calls[2])
+	}
+
+	// Turn 4: BOTH knownForeign and unknownForeign must have been learned into refusedSeals (1 call only).
+	before4 := len(cop.asked())
+	if code, out := gatewayPost(t, s, "/v1/responses", turn3); code != 200 || !strings.Contains(out, "COPILOT_DONE") {
+		t.Fatalf("turn 4 failed: %d %s", code, out)
+	}
+	calls4 := cop.asked()[before4:]
+	if len(calls4) != 1 || strings.Contains(string(calls4[0]), knownForeign) || strings.Contains(string(calls4[0]), unknownForeign) || !strings.Contains(string(calls4[0]), copilotSeal) {
+		t.Fatalf("expected both foreign seals proactively stripped on turn 4 (calls=%d): %s", len(calls4), string(calls4[0]))
+	}
+}
+
+func TestForkCopilotHandoffOwnOnlyAndUnrelated400NoFalseLearn(t *testing.T) {
+	cop := &forkMockCopilot{}
+	setupForkCopilotAndCodex(t, cop, "gAAAA-codex-unused")
+	s := New()
+
+	// Produce one known Copilot-own seal first.
+	if code, out := gatewayPost(t, s, "/v1/responses", `{"model":"copilot/gpt-6.2-sol","stream":false,"store":false,"prompt_cache_key":"thread-own-only","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"t1"}]}]}`); code != 200 || !strings.Contains(out, "COPILOT_DONE") {
+		t.Fatalf("copilot turn 1 failed: %d %s", code, out)
+	}
+	copilotSeal := "gAAAA-copilot-seal-1"
+
+	// (a) Unrelated empty 400 with ONLY known target-own seal: must NOT retry or drop own seal.
+	cop.mu.Lock()
+	cop.alwaysEmpty400 = true
+	cop.mu.Unlock()
+	ownOnlyReq := `{"model":"copilot/gpt-6.2-sol","stream":false,"store":false,"prompt_cache_key":"thread-own-only","input":[` +
+		`{"type":"reasoning","id":"rs_own","summary":[],"encrypted_content":"` + copilotSeal + `"},` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"t2"}]}` +
+		`]}`
+	beforeA := len(cop.asked())
+	if code, _ := gatewayPost(t, s, "/v1/responses", ownOnlyReq); code != 400 {
+		t.Fatalf("expected 400 for unrelated own-only error, got %d", code)
+	}
+	if callsA := cop.asked()[beforeA:]; len(callsA) != 1 {
+		t.Fatalf("expected 0 retries when only known own seal is present, got %d calls", len(callsA))
+	}
+
+	// (b) Unrelated empty 400 with an unknown seal: retries once without unknown seal, still gets 400,
+	// and MUST NOT record the unknown seal into refusedSeals.
+	unknownBenign := "gAAAA-benign-unknown-seal"
+	unkReq := `{"model":"copilot/gpt-6.2-sol","stream":false,"store":false,"prompt_cache_key":"thread-unrelated-unk","input":[` +
+		`{"type":"reasoning","id":"rs_unk","summary":[],"encrypted_content":"` + unknownBenign + `"},` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"t2"}]}` +
+		`]}`
+	beforeB := len(cop.asked())
+	if code, _ := gatewayPost(t, s, "/v1/responses", unkReq); code != 400 {
+		t.Fatalf("expected 400 for persistent unrelated error, got %d", code)
+	}
+	if callsB := cop.asked()[beforeB:]; len(callsB) != 2 || strings.Contains(string(callsB[1]), unknownBenign) {
+		t.Fatalf("expected 1 retry without unknown seal, got %d calls", len(callsB))
+	}
+
+	// Once the unrelated 400 clears, unknownBenign must still be sent untouched on the next turn.
+	cop.mu.Lock()
+	cop.alwaysEmpty400 = false
+	cop.mu.Unlock()
+	beforeC := len(cop.asked())
+	if code, out := gatewayPost(t, s, "/v1/responses", unkReq); code != 200 || !strings.Contains(out, "COPILOT_DONE") {
+		t.Fatalf("expected 200 after unrelated 400 cleared, got %d %s", code, out)
+	}
+	if callsC := cop.asked()[beforeC:]; len(callsC) != 1 || !strings.Contains(string(callsC[0]), unknownBenign) {
+		t.Fatalf("unknown seal must not be falsely learned into refusedSeals (calls=%d): %s", len(callsC), string(callsC[0]))
+	}
 }
