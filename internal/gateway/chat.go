@@ -696,6 +696,8 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 		}
 	} else if r.Effort != "" {
 		out["reasoning_effort"] = r.Effort
+	} else if r.ThinkOff && r.OffLevel != "" {
+		out["reasoning_effort"] = r.OffLevel
 	}
 	if len(r.Tools) > 0 {
 		var tools []map[string]any
@@ -1524,6 +1526,7 @@ func (d *chatDecoder) decode(data string, emit func(Event)) error {
 				Content          json.RawMessage `json:"content"`
 				ReasoningContent string          `json:"reasoning_content"`
 				Reasoning        string          `json:"reasoning"`
+				ReasoningText    string          `json:"reasoning_text"`
 				ToolCalls        []cToolCall     `json:"tool_calls"`
 				// Vertex AI's OpenAI-compatible API marks a chunk of
 				// Gemini's thoughts here, the thought its content
@@ -1581,6 +1584,9 @@ func (d *chatDecoder) decode(data string, emit func(Event)) error {
 		t := c.Delta.ReasoningContent
 		if t == "" {
 			t = c.Delta.Reasoning
+		}
+		if t == "" {
+			t = c.Delta.ReasoningText
 		}
 		// Mistral's content may be typed parts, its thinking among them
 		// (#483): a chunk that couldn't be read as a string lost both

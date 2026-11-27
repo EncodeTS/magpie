@@ -9164,6 +9164,12 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 				r.Effort, req = e, &r
 			}
 		}
+		if !req.GeminiCompat && to == provider.Chat && copilotGeminiModel(p, model) && req.ThinkOff {
+			if l := onEffort(p, model); l != req.OffLevel {
+				r := *req
+				r.OffLevel, req = l, &r
+			}
+		}
 		// the tier the client asked for goes to a provider the user added
 		// by its address as it was asked (Request.Tier), and to another
 		// magpie, which offered it and serves it as its own Codex would be

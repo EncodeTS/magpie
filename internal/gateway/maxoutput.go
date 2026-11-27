@@ -357,7 +357,11 @@ func thinksByDefault(p provider.Provider, model string) bool {
 	if strings.HasSuffix(p.VendorHost(), "tencentmaas.com") && strings.Contains(strings.ToLower(model), "deepseek") {
 		return true
 	}
-	return googleGemini(p, model) && geminiThinksByDefault(model)
+	return (googleGemini(p, model) || copilotGeminiModel(p, model)) && geminiThinksByDefault(model)
+}
+
+func copilotGeminiModel(p provider.Provider, model string) bool {
+	return copilotAccount(p) && strings.Contains(strings.ToLower(model), "gemini")
 }
 
 // googleGemini is whether p serves model as Google serves it: one of
@@ -411,6 +415,18 @@ func namesReasoning(proto provider.Protocol, body []byte) bool {
 	return true
 }
 
+func askedThinkOff(proto provider.Protocol, body []byte) bool {
+	switch proto {
+	case provider.Anthropic:
+		return gjson.GetBytes(body, "thinking.type").Str == "disabled"
+	case provider.Chat:
+		return strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "reasoning_effort").Str), "none")
+	case provider.Responses:
+		return strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "reasoning.effort").Str), "none")
+	}
+	return false
+}
+
 // withThinkingRoom is body, in proto's words, with the reply limit a client
 // named raised by the room a default-thinking model (thinksByDefault) needs
 // to think in before it answers (replyRoom at its default effort, high),
@@ -418,8 +434,15 @@ func namesReasoning(proto provider.Protocol, body []byte) bool {
 // output for the model, and the limit is a small one (at most
 // thinkingRoomBelow). The model's own limit, where known, still caps it.
 func withThinkingRoom(p provider.Provider, model string, proto provider.Protocol, body []byte) []byte {
-	if !thinksByDefault(p, model) || namesReasoning(proto, body) || userOutput(p, model) > 0 {
+	if !thinksByDefault(p, model) || userOutput(p, model) > 0 {
 		return body
+	}
+	roomEffort := "high"
+	if namesReasoning(proto, body) {
+		if !(copilotGeminiModel(p, model) && askedThinkOff(proto, body)) {
+			return body
+		}
+		roomEffort = "low"
 	}
 	var field string
 	switch proto {
@@ -441,7 +464,7 @@ func withThinkingRoom(p provider.Provider, model string, proto provider.Protocol
 	if n <= 0 || n > thinkingRoomBelow {
 		return body
 	}
-	n = replyRoom(n, "high")
+	n = replyRoom(n, roomEffort)
 	if own := askedOutput(p, model); own > 0 && n > own {
 		n = own
 	}
