@@ -3709,6 +3709,7 @@ func boundCallIDs(body []byte) []byte {
 // compaction).
 var openaiOnly = [][]byte{[]byte(`"internal_chat_message_metadata_passthrough"`),
 	[]byte(`"encrypted_function_args"`), []byte(`"stream_options"`), []byte(`"configuration_update"`),
+	[]byte(`"other"`),
 	[]byte(`"` + outputReplay + `"`), []byte(`"encrypted_content"`)}
 
 // outputReplay is what Codex asks OpenAI for with output token replay on
@@ -3786,6 +3787,10 @@ func forVendor(p provider.Provider, body []byte, compaction bool) []byte {
 				if e := updateEffort(raw); e != "" {
 					updated = e
 				}
+				continue
+			}
+			if string(it["type"]) == `"other"` {
+				changed = true
 				continue
 			}
 			_, meta := it["internal_chat_message_metadata_passthrough"]
@@ -3874,7 +3879,7 @@ func forVendorChanges(body []byte) bool {
 			return false
 		}
 		typ := string(memberOrNil(it, "type"))
-		if typ == `"configuration_update"` {
+		if typ == `"configuration_update"` || typ == `"other"` {
 			return true
 		}
 		_, meta := memberOf(it, "internal_chat_message_metadata_passthrough")
@@ -4343,7 +4348,7 @@ func inputKindRefused(rec *recorder, err error) bool {
 	return inputKindWords.Match(rec.body.Bytes())
 }
 
-var inputKindWords = lazyre.New(`(?i)unsupported[ _]input[ _]item|unknown item type`)
+var inputKindWords = lazyre.New(`(?i)unsupported[ _]input[ _]item|unknown item type|invalid value:\s*'[^']+'\.?\s*supported values are:.*'message'`)
 
 // compactFailure names who answered a summary request with a failure — the
 // provider, the model and the provider's base URL — and what it said.

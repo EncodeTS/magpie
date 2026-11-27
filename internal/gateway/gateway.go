@@ -8188,6 +8188,16 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 			}
 		}
 	}
+	if proto != provider.Anthropic && res.StatusCode == http.StatusBadRequest && hasSampling(body) {
+		b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+		res.Body.Close()
+		res.Body = io.NopCloser(bytes.NewReader(b))
+		if nb, ok := withoutSampling(body); ok && samplingDeprecated.Match(b) {
+			if res, err = s.forward(r.Context(), p, proto, path, p.Prepare(nb), r.Header); err != nil {
+				return writeError(w, proto, 502, p.Name+": "+err.Error()), err.Error(), true
+			}
+		}
+	}
 	defer res.Body.Close()
 	u.RequestID = requestID(res.Header)
 	if res.StatusCode >= 400 {
@@ -9414,7 +9424,7 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			r.hourMarks, req = false, &r
 			continue
 		}
-		if to == provider.Anthropic && res.StatusCode == http.StatusBadRequest &&
+		if res.StatusCode == http.StatusBadRequest &&
 			samplingDeprecated.Match(b) && (req.Temp != nil || req.TopP != nil) {
 			// a Claude by a name samplingAsTaken can't read refuses the
 			// sampling a Chat or Responses client sent (#1454): asked once

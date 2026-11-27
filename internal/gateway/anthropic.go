@@ -867,7 +867,7 @@ func hasSampling(body []byte) bool {
 // samplingDeprecated is a Claude refusing a sampling parameter, as Haiku
 // 5.5 does: "`temperature` is deprecated for this model." (and `top_p`,
 // `top_k`).
-var samplingDeprecated = lazyre.New("(?i)\\b(?:temperature|top_p|top_k)`?\\W+is (?:deprecated|not supported) for this model")
+var samplingDeprecated = lazyre.New("(?i)\\b(?:temperature|top_p|top_k)['`\"]?\\W+is (?:deprecated|not supported) (?:for|with) this model")
 
 // withoutSampling is body without temperature, top_p and top_k; false
 // when it has none of them.
